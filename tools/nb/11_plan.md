@@ -1,0 +1,2 @@
+## 3 · Plan the run
+The notebook measures **your GPU's real throughput** on the chosen model, finds the largest micro-batch that fits in memory, and sizes the training run to your `TRAIN_HOURS` using a warmup-stable-decay schedule (so the learning rate always finishes decaying by the end of the time you gave it). If a plan for this run already exists in Drive it is reused unchanged, which is what makes resuming exact.

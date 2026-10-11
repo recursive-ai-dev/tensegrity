@@ -1,0 +1,5 @@
+FLOPs/token small=6.64M big=12.72M  ->  scratch: 400 steps of 2m; ladder: 383 steps of 1m + 200 steps of 2m (equal compute)
+  ladder   seed 0: val 1.4727 bpb (510s)  (small 1.594 -> parent 1.594 == grown 1.594)
+  ladder   seed 1: val 1.4642 bpb (514s)  (small 1.585 -> parent 1.585 == grown 1.585)
+
+ladder   1.4684 +- 0.0060   [1.4727, 1.4642]
