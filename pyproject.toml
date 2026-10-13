@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensegrity-lm"
+version = "2.0.0"
+description = "Byte-level language models from 1M to 115M parameters with a verified, trainable growth ladder"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.3", "numpy>=1.23", "safetensors>=0.4"]
+
+[project.optional-dependencies]
+data = ["pyarrow", "datasets"]
+viz = ["matplotlib", "ipython"]
+hub = ["huggingface_hub"]
+dev = ["pytest", "pyarrow", "matplotlib", "nbformat", "nbclient", "ipykernel"]
+
+[project.scripts]
+tensegrity = "tensegrity.cli:main"
+
+[tool.setuptools]
+packages = ["tensegrity"]

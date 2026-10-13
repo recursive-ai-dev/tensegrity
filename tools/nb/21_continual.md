@@ -1,0 +1,2 @@
+## 7 · Teach it something new without forgetting (EWC + replay)
+Fine-tune on a *second* corpus while protecting what the model already knows, using two complementary tools: **replay** (a fraction of every batch still comes from the original data) and **Elastic Weight Consolidation** (a quadratic penalty, weighted by each weight's Fisher information, that resists moving the weights that mattered for the old data). The cell prints validation before and after on *both* corpora so you can see the trade-off and tune `EWC_LAMBDA`.
