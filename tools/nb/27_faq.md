@@ -15,3 +15,9 @@
 **Files in Drive.** `MyDrive/tensegrity/runs/<run>/` holds `ckpt_latest.pt` (full, resumable), `ckpt_best.pt` (weights only), `train_log.jsonl`, `run_plan.json`. Exports go to `exports/`.
 
 **Reporting a bug / contributing.** https://github.com/recursive-ai-dev/tensegrity
+
+**"cannot resume exactly: the training policy / data differs".** Resuming continues the *same* run, so the model, the training settings (learning rate, batch, optimizer, ...) and the data must be the ones it started with — the message lists what differs. If the change is intentional, start a new run from the weights (`INIT_FROM_WEIGHTS`), or call `Trainer.fit(on_policy_change="adopt")` / `fit(on_data_change="adopt")` to accept it as a recorded new phase of the run.
+
+**"Why is my validation split not the last 5%?"** It is chosen per *document* by hashing, so every document is wholly in one split and exact duplicates cannot leak across it. A corpus with too few documents uses a contiguous tail split instead — the data audit says which one you got.
+
+**Is `bits/byte` the same as the old `bpb`?** The headline number is now the model's total NLL on the held-out *bytes* divided by their count; document-boundary tokens are reported separately. The two agree when there are no boundaries in the evaluated windows, and otherwise differ by roughly the share of boundary tokens among the targets (about 0.1% for story-length documents).

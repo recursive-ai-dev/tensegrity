@@ -24,6 +24,11 @@ class ByteTokenizer:
     BOS = 256
     EOS = 257
     PAD = 258
+    # Prepared data is ``bytes + EOS`` per document and contains no BOS, so the only start-of-document
+    # context the model has ever seen as INPUT is EOS (the previous document's terminator). Start
+    # generation from DOC_START: a BOS prompt is out-of-distribution (measured on a small model: ~3.1
+    # bits/byte over a document's first 12 bytes after BOS vs ~0.3 after EOS).
+    DOC_START = EOS
     _SPECIAL_IDS = frozenset((BOS, EOS, PAD))
     _SPECIAL_TOKEN_STRINGS = {BOS: "<|bos|>", EOS: "<|eos|>", PAD: "<|pad|>"}
 

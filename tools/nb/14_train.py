@@ -1,7 +1,7 @@
 #@title 4 · Train (resumable) { display-mode: "form" }
 import math
 live = tg.LivePlot()
-trainer = tg.Trainer(model, TC, PLAN, DATA_DIR, RUN_DIR, device=DEVICE, callbacks=[live])
+trainer = tg.Trainer(model, TC, PLAN, DATA_DIR, RUN_DIR, device=DEVICE, callbacks=[live], lineage=LINEAGE)
 RESULT = trainer.fit(resume=True)
 print("\n" + "=" * 70)
 if RESULT["status"] == "completed":
