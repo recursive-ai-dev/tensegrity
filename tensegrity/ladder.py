@@ -26,6 +26,7 @@ from .checkpoint import load_checkpoint, load_model
 from .config import TensegrityConfig
 from .growth import check_function_preserved, check_growth_trainable, grow_model, retarget
 from .hw import autotune_micro_batch, measure_throughput, pick_device, pick_dtype
+from .manifest import file_record
 from .model import TensegrityLM
 from .presets import get_preset, get_preset_config, train_setup
 from .schedule import make_plan, plan_for_time_budget
@@ -106,7 +107,7 @@ def climb_ladder(rungs: Sequence[str], data_dirs, root: str, *, hours=None, toke
             say(f"[ladder] rung {i} ({preset.label}) already finished: val {r.best_val_bpb:.3f} bpb -- skipping")
             results.append(r)
             prev_dir = run_dir
-            prev_cfg = TensegrityConfig.from_dict(load_checkpoint(os.path.join(run_dir, "ckpt_best.pt"))["config"])
+            prev_cfg = TensegrityConfig.from_dict(load_checkpoint(os.path.join(run_dir, "ckpt_best.pt"))["config"], strict=True)
             continue
 
         t0 = time.time()
@@ -163,8 +164,9 @@ def climb_ladder(rungs: Sequence[str], data_dirs, root: str, *, hours=None, toke
             for k, v in (tc_overrides or {}).items():
                 setattr(tc, k, v)
 
+        lineage = {"grown_from": file_record(os.path.join(prev_dir, "ckpt_best.pt")), "rung": i} if i > 0 else {"rung": 0}
         trainer = Trainer(model, tc, plan, data_dirs, run_dir, data_weights=data_weights, device=dev,
-                          callbacks=callbacks)
+                          callbacks=callbacks, lineage=lineage)
         res = trainer.fit(resume=True)
         r = RungResult(rung=name, params=cfg.n_params(), status=res["status"], steps=res["step"],
                        tokens_seen=res["tokens_seen"], best_val_loss=res["best_val_loss"],

@@ -120,9 +120,11 @@ def test_notebook_executes_end_to_end_offline(tmp_path):
                     if o.get("output_type") == "stream")
     if os.environ.get("TENSEGRITY_NB_OUT"):          # debugging aid: keep the executed notebook's text output
         open(os.environ["TENSEGRITY_NB_OUT"], "w").write(out)
-    for needle in ("dependencies OK", "Tensegrity 2.0.0", "data ready:", "training plan", "Finished. Best validation",
-                   "validation: ", "function preserved", "trainability:", "validation unchanged at", "before fine-tuning",
-                   "after (replay+EWC)", "tok/s", "wrote "):
+    import tensegrity
+    for needle in ("dependencies OK", f"Tensegrity {tensegrity.__version__}", "fingerprint : sha256:", "integrity   : OK",
+                   "data ready:", "training plan", "PREFLIGHT OK", "reload to identical outputs", "Finished. Best validation",
+                   "validation: ", "bits/byte", "copy/retrieval probe", "growth ACCEPTED", "function preserved", "trainability:",
+                   "validation unchanged at", "base model: old", "non-dominated", "forgetting", "tok/s", "wrote run report"):
         assert needle in out, f"missing in notebook output: {needle!r}"
     assert (tmp_path / "proj" / "runs").is_dir() and (tmp_path / "proj" / "ladders").is_dir()
     assert not any(o.get("output_type") == "error" for c in nb.cells if c.cell_type == "code" for o in c.outputs)

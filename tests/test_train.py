@@ -9,7 +9,7 @@ import torch
 
 from conftest import small_cfg
 from tensegrity import (EMA, ByteDataset, RunPlan, TensegrityLM, TrainConfig, Trainer,
-                        autotune_micro_batch, default_ema_decay, evaluate, evaluate_batches, get_lr, get_lr_wsd,
+                        autotune_micro_batch, default_ema_decay, evaluate, evaluate_batches, extend_plan, get_lr, get_lr_wsd,
                         load_model, load_run_plan, make_plan, measure_throughput, plan_for_time_budget, preflight, preflight_or_fallback)
 from tensegrity.checkpoint import load_checkpoint
 
@@ -176,8 +176,9 @@ def test_grad_checkpointing_changes_nothing_but_memory(corpus_dir, tmp_path):
 def test_muon_training_runs_and_resumes(corpus_dir, tmp_path):
     out = str(tmp_path / "m")
     tc = _tc(optimizer="muon", learning_rate=2e-3, min_lr=2e-4, eval_interval=6)
-    Trainer(TensegrityLM(small_cfg()), tc, _plan(6, 2, 3, 1), corpus_dir, out, device="cpu").fit()
-    r = Trainer(TensegrityLM(small_cfg()), tc, _plan(12, 2, 8, 2), corpus_dir, out, device="cpu").fit()
+    short = RunPlan(8 * 48, 4, 2, 3, 1, "wsd")             # stopped at step 4, before its cool-down (which starts at 5)
+    Trainer(TensegrityLM(small_cfg()), tc, short, corpus_dir, out, device="cpu").fit()
+    r = Trainer(TensegrityLM(small_cfg()), tc, extend_plan(short, 8), corpus_dir, out, device="cpu").fit()
     assert r["step"] == 12
 
 
