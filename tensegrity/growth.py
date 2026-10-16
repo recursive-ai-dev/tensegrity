@@ -38,7 +38,8 @@ from .model import TensegrityLM
 # checkpointing knobs, ...) is free to differ between rungs.
 _LOCKED = (
     "vocab_size", "sliding_window", "global_every", "rope_base", "bias", "use_qk_norm",
-    "embed_scale", "logit_soft_cap", "use_confidence_head", "byte_mix_kernel", "x0_mix",
+    "embed_scale", "logit_soft_cap", "use_confidence_head", "byte_mix_kernel",
+    "byte_mix_bilinear", "x0_mix", "v0_mix",
 )
 
 
@@ -52,7 +53,7 @@ def _check_compatible(old: TensegrityConfig, new: TensegrityConfig) -> None:
                     f"grow by adding heads, not by widening them)")
     if old.gqa_ratio != new.gqa_ratio:
         errs.append(f"GQA ratio: {old.gqa_ratio} -> {new.gqa_ratio} (would re-map query heads to KV groups)")
-    for f in ("n_layer", "n_embd", "n_head", "n_kv_head", "ffn_hidden", "block_size"):
+    for f in ("n_layer", "n_loops", "n_embd", "n_head", "n_kv_head", "ffn_hidden", "block_size"):
         if getattr(new, f) < getattr(old, f):
             errs.append(f"{f}: {getattr(old, f)} -> {getattr(new, f)} (growth cannot shrink)")
     if errs:
@@ -69,6 +70,8 @@ def retarget(old: TensegrityConfig, size_from: TensegrityConfig, keep_context: b
     keep = {f: getattr(old, f) for f in _LOCKED}
     if keep_context:
         keep["block_size"] = old.block_size
+    if size_from.n_loops < old.n_loops:
+        keep["n_loops"] = old.n_loops
     d = size_from.to_dict()
     d.update(keep)
     d["gain_init"] = None
@@ -78,12 +81,16 @@ def retarget(old: TensegrityConfig, size_from: TensegrityConfig, keep_context: b
 def derive_target(old: TensegrityConfig, new_n_layer: Optional[int] = None,
                   ffn_growth_mult: Optional[float] = None, new_n_embd: Optional[int] = None,
                   new_n_head: Optional[int] = None, new_n_kv_head: Optional[int] = None,
-                  new_block_size: Optional[int] = None) -> TensegrityConfig:
+                  new_block_size: Optional[int] = None, new_n_loops: Optional[int] = None) -> TensegrityConfig:
     """Build the target config from the v1-style keyword arguments."""
     d = old.to_dict()
     if new_n_layer is not None:
         d["n_layer"] = new_n_layer
         d["gain_init"] = None if new_n_layer != old.n_layer else old.gain_init
+    if new_n_loops is not None:
+        d["n_loops"] = new_n_loops
+        if new_n_loops != old.n_loops and new_n_layer is None:
+            d["gain_init"] = None
     if ffn_growth_mult is not None:
         if ffn_growth_mult < 1.0:
             raise ValueError("ffn_growth_mult must be >= 1.0")
@@ -111,6 +118,11 @@ def _randomize_like_init(t: torch.Tensor, std: float) -> None:
 
 
 @torch.no_grad()
+def _reader_std(w_old: torch.Tensor, min_std: float) -> float:
+    return max(min_std, float(w_old.float().pow(2).mean().sqrt()))
+
+
+@torch.no_grad()
 def _grow_block(ob: nn.Module, nb: nn.Module, oc: TensegrityConfig, nc: TensegrityConfig) -> None:
     D0, D1 = oc.n_embd, nc.n_embd
     hd = oc.head_dim
@@ -130,15 +142,30 @@ def _grow_block(ob: nn.Module, nb: nn.Module, oc: TensegrityConfig, nc: Tensegri
     nb.ffn_gain.copy_(ob.ffn_gain * gain_scale)
     if ob.x0_gain is not None:
         nb.x0_gain.copy_(ob.x0_gain)  # x0 and the stream scale together: no extra factor
+    if nb.loop_attn_gains is not None:
+        nb.loop_attn_gains.zero_()
+        nb.loop_ffn_gains.zero_()
+        if nb.loop_x0_gains is not None:
+            nb.loop_x0_gains.zero_()
+        if ob.loop_attn_gains is not None:
+            n_old = ob.loop_attn_gains.numel()
+            nb.loop_attn_gains[:n_old].copy_(ob.loop_attn_gains * gain_scale)
+            nb.loop_ffn_gains[:n_old].copy_(ob.loop_ffn_gains * gain_scale)
+            if ob.loop_x0_gains is not None and nb.loop_x0_gains is not None:
+                nb.loop_x0_gains[:n_old].copy_(ob.loop_x0_gains)
 
-    # ---- attention.   READERS random (already init'd by the fresh model), WRITERS zero.
+    # ---- attention.   READERS random (matched to parent weight RMS), WRITERS zero.
     a_o, a_n = ob.attn, nb.attn
     for lin in ("q_proj", "k_proj", "v_proj"):
         out0 = q0 if lin == "q_proj" else kv0
+        w_old = getattr(a_o, lin).weight
         w = getattr(a_n, lin).weight
-        w[:out0, :D0].copy_(getattr(a_o, lin).weight)       # old heads, old channels: exact copy
+        r_std = _reader_std(w_old, std)
+        if w.shape[0] > out0:
+            _randomize_like_init(w[out0:, :], r_std)
+        w[:out0, :D0].copy_(w_old)                           # old heads, old channels: exact copy
         if wide:                                             # old heads reading NEW channels: input is 0 at growth,
-            _randomize_like_init(w[:out0, D0:], std)         # so random init is free and breaks the symmetry later
+            _randomize_like_init(w[:out0, D0:], r_std)       # so random init is free and breaks the symmetry later
         if oc.bias:
             getattr(a_n, lin).bias[:out0].copy_(getattr(a_o, lin).bias)
     w_o = a_n.o_proj.weight
@@ -150,17 +177,22 @@ def _grow_block(ob: nn.Module, nb: nn.Module, oc: TensegrityConfig, nc: Tensegri
     if a_o.q_norm is not None:                               # head_dim unchanged -> per-head norms copy 1:1
         a_n.q_norm.weight.copy_(a_o.q_norm.weight)
         a_n.k_norm.weight.copy_(a_o.k_norm.weight)
+    if a_o.v0_gain is not None and a_n.v0_gain is not None:
+        a_n.v0_gain[:oc.n_kv_head].copy_(a_o.v0_gain)
 
     # ---- feed-forward
     f_o, f_n = ob.ffn, nb.ffn
     for lin in ("w_gate", "w_up"):
+        w_old = getattr(f_o, lin).weight
         w = getattr(f_n, lin).weight                        # (h1, D1): readers of the stream
-        w[:h0, :D0].copy_(getattr(f_o, lin).weight)
+        r_std = _reader_std(w_old, std)
+        if w.shape[0] > h0:
+            _randomize_like_init(w[h0:, :], r_std)
+        w[:h0, :D0].copy_(w_old)
         if wide:
-            _randomize_like_init(w[:h0, D0:], std)
+            _randomize_like_init(w[:h0, D0:], r_std)
         if oc.bias:
             getattr(f_n, lin).bias[:h0].copy_(getattr(f_o, lin).bias)
-        # w[h0:, :]  = fresh random init -> new hidden units are readers, they stay random
     w_d = f_n.w_down.weight                                  # (D1, h1): writer
     w_d.zero_()
     w_d[:D0, :h0].copy_(f_o.w_down.weight)
@@ -175,6 +207,7 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
                new_n_layer: Optional[int] = None, ffn_growth_mult: Optional[float] = None,
                new_n_embd: Optional[int] = None, new_n_head: Optional[int] = None,
                new_n_kv_head: Optional[int] = None, new_block_size: Optional[int] = None,
+               new_n_loops: Optional[int] = None,
                device: Optional[Union[str, torch.device]] = None, seed: Optional[int] = 0
                ) -> Tuple[TensegrityLM, TensegrityConfig]:
     """
@@ -186,15 +219,15 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
 
     Growth axes
       * depth   -- new blocks are appended with residual gains = 0 (exact no-op, ReZero-style start);
-      * FFN     -- new hidden units: random gate/up (readers), zero down (writer);
+      * loops   -- extra loop passes are added with loop residual gains = 0 (exact no-op);
+      * FFN     -- new hidden units: RMS-matched random gate/up (readers), zero down (writer);
       * width   -- more heads and residual channels, per the reader/writer rule in the module doc;
       * context -- ``block_size`` may grow (RoPE is relative; weights are unchanged).
-    Optimizer state is NOT carried over -- build a fresh optimizer for the grown model.
     """
     old_cfg = old_cfg or old_model.cfg
     if target is None:
         target = derive_target(old_cfg, new_n_layer, ffn_growth_mult, new_n_embd, new_n_head,
-                               new_n_kv_head, new_block_size)
+                               new_n_kv_head, new_block_size, new_n_loops)
     _check_compatible(old_cfg, target)
     new_cfg = target
     device = device if device is not None else next(old_model.parameters()).device
@@ -229,17 +262,94 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
     if old_model.byte_mix is not None:
         new_model.byte_mix.weight.zero_()
         new_model.byte_mix.weight[:, :D0].copy_(old_model.byte_mix.weight)
+        if old_model.byte_mix.bi_weight is not None and new_model.byte_mix.bi_weight is not None:
+            new_model.byte_mix.bi_weight.zero_()
+            new_model.byte_mix.bi_weight[:, :D0].copy_(old_model.byte_mix.bi_weight)
 
     # ---- blocks
     for i in range(old_cfg.n_layer):
         _grow_block(old_model.blocks[i], new_model.blocks[i], old_cfg, new_cfg)
-    for i in range(old_cfg.n_layer, new_cfg.n_layer):        # appended blocks: exact no-ops at init
+    ref_blk = old_model.blocks[-1]
+    for i in range(old_cfg.n_layer, new_cfg.n_layer):        # appended blocks: exact no-ops at init, RMS-matched weights
         blk = new_model.blocks[i]
+        for sub_o, sub_n, names in (
+            (ref_blk.attn, blk.attn, ("q_proj", "k_proj", "v_proj", "o_proj")),
+            (ref_blk.ffn, blk.ffn, ("w_gate", "w_up", "w_down")),
+        ):
+            for lin_name in names:
+                wo = getattr(sub_o, lin_name).weight
+                wn = getattr(sub_n, lin_name).weight
+                _randomize_like_init(wn, _reader_std(wo, new_cfg.init_std))
         blk.attn_gain.zero_()
         blk.ffn_gain.zero_()
         if blk.x0_gain is not None:
             blk.x0_gain.zero_()
+        if blk.loop_attn_gains is not None:
+            blk.loop_attn_gains.zero_()
+            blk.loop_ffn_gains.zero_()
+            if blk.loop_x0_gains is not None:
+                blk.loop_x0_gains.zero_()
     return new_model, new_cfg
+
+
+@torch.no_grad()
+def grow_optimizer_state(old_model: nn.Module, old_opt_or_state: Any,
+                         new_model: nn.Module, new_opt: torch.optim.Optimizer) -> int:
+    """Transplant optimizer state (Muon ``momentum_buffer``, AdamW ``exp_avg`` / ``exp_avg_sq`` /
+    ``step``) from ``old_model`` onto ``new_opt`` (built for ``new_model``).
+
+    ``old_opt_or_state`` may be either a live :class:`torch.optim.Optimizer` or a saved
+    ``optimizer_state_dict`` (e.g. from ``ckpt_latest.pt``). Newly grown slices of ``exp_avg_sq``
+    are initialised to the mean second moment of the parent parameter so new channels/units do not
+    take an uncalibrated step on the first update. Returns the number of transplanted parameters.
+    """
+    if old_opt_or_state is None:
+        return 0
+    old_by_name: Dict[str, Dict[str, Any]] = {}
+    if isinstance(old_opt_or_state, torch.optim.Optimizer):
+        for n, p in old_model.named_parameters():
+            if p in old_opt_or_state.state and old_opt_or_state.state[p]:
+                old_by_name[n] = old_opt_or_state.state[p]
+    elif isinstance(old_opt_or_state, dict) and "state" in old_opt_or_state and "param_groups" in old_opt_or_state:
+        # Reconstruct the flat parameter ordering configure_optimizer produces on old_model
+        use_muon = any(g.get("use_muon", False) for g in old_opt_or_state["param_groups"])
+        dummy = old_model.configure_optimizer(0.1, 1e-3, (0.9, 0.95), "cpu", use_muon=use_muon)
+        id_to_name = {id(p): n for n, p in old_model.named_parameters()}
+        ordered_names = [id_to_name[id(p)] for g in dummy.param_groups for p in g["params"]]
+        state_map = old_opt_or_state["state"]
+        for idx, name in enumerate(ordered_names):
+            st = state_map.get(idx, state_map.get(str(idx)))
+            if st:
+                old_by_name[name] = st
+    else:
+        return 0
+
+    count = 0
+    for name, np_ in new_model.named_parameters():
+        ost = old_by_name.get(name)
+        if not ost:
+            continue
+        nst = new_opt.state[np_]
+        if "momentum_buffer" in ost:
+            mb_old = ost["momentum_buffer"]
+            buf = torch.zeros_like(np_)
+            sl = tuple(slice(0, min(s, np_.shape[i])) for i, s in enumerate(mb_old.shape))
+            buf[sl].copy_(mb_old[sl].to(np_.device, np_.dtype))
+            nst["momentum_buffer"] = buf
+            count += 1
+        elif "exp_avg" in ost and "exp_avg_sq" in ost:
+            ea_old, eas_old = ost["exp_avg"], ost["exp_avg_sq"]
+            ea = torch.zeros_like(np_)
+            eas = torch.full_like(np_, float(eas_old.float().mean()))
+            sl = tuple(slice(0, min(s, np_.shape[i])) for i, s in enumerate(ea_old.shape))
+            ea[sl].copy_(ea_old[sl].to(np_.device, np_.dtype))
+            eas[sl].copy_(eas_old[sl].to(np_.device, np_.dtype))
+            nst["exp_avg"] = ea
+            nst["exp_avg_sq"] = eas
+            step_val = ost.get("step", 0)
+            nst["step"] = int(step_val.item()) if isinstance(step_val, torch.Tensor) else int(step_val)
+            count += 1
+    return count
 
 
 # =============================================================================
@@ -354,6 +464,9 @@ def check_growth_trainable(new_model: TensegrityLM, old_cfg: TensegrityConfig, x
                 layer = int(name.split(".")[1])
                 if layer >= old_cfg.n_layer and name.endswith(("attn_gain", "ffn_gain")):
                     best[name] = max(best.get(name, 0.0), float(p.grad.abs().max()))
+                    continue
+                if new.n_loops > old_cfg.n_loops and name.endswith(("loop_attn_gains", "loop_ffn_gains")):
+                    best[name] = max(best.get(name, 0.0), float(p.grad[old_cfg.n_loops - 1:].abs().max()))
                     continue
                 for k, mask in enumerate(_new_regions(old_cfg, name, tuple(p.shape), layer)):
                     key = f"{name}#{k}"

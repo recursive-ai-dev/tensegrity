@@ -111,8 +111,9 @@ def write_model_card(out_dir: str, cfg: TensegrityConfig, name: str = "model",
         f"- layers {cfg.n_layer}, width {cfg.n_embd}, {cfg.n_head} heads / {cfg.n_kv_head} KV heads (head_dim {cfg.head_dim})",
         f"- context {cfg.block_size} bytes; every {cfg.global_every}rd layer global, the rest sliding-window {cfg.sliding_window}",
         f"- SwiGLU FFN width {cfg.ffn_hidden}; RoPE (base {cfg.rope_base:g}); RMSNorm; learnable residual gains",
-        f"- Q/K-norm {cfg.use_qk_norm}, logit soft-cap {cfg.logit_soft_cap}, ByteMix kernel {cfg.byte_mix_kernel or 'off'}, "
-        f"x0-mix {cfg.x0_mix}, confidence head {cfg.use_confidence_head}", "",
+        f"- Q/K-norm {cfg.use_qk_norm}, logit soft-cap {cfg.logit_soft_cap}, ByteMix kernel {cfg.byte_mix_kernel or 'off'}"
+        f"{' (bilinear)' if cfg.byte_mix_bilinear else ''}, "
+        f"x0-mix {cfg.x0_mix}, v0-mix {cfg.v0_mix}, loops {cfg.n_loops}, confidence head {cfg.use_confidence_head}", "",
         "## Training", "",
         f"- dataset: {dataset}",
     ]

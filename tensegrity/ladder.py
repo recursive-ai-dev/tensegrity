@@ -24,7 +24,7 @@ import torch
 
 from .checkpoint import load_checkpoint, load_model
 from .config import TensegrityConfig
-from .growth import check_function_preserved, check_growth_trainable, grow_model, retarget
+from .growth import check_function_preserved, check_growth_trainable, grow_model, grow_optimizer_state, retarget
 from .hw import autotune_micro_batch, measure_throughput, pick_device, pick_dtype
 from .model import TensegrityLM
 from .presets import get_preset, get_preset_config, train_setup
@@ -112,6 +112,7 @@ def climb_ladder(rungs: Sequence[str], data_dirs, root: str, *, hours=None, toke
         t0 = time.time()
         saved = load_run_plan(run_dir)
         growth_diff: Optional[float] = None
+        init_opt_fn: Optional[Callable] = None
         if i == 0:
             cfg = get_preset_config(name, **(model_overrides or {}))
             model = TensegrityLM(cfg)
@@ -127,6 +128,12 @@ def climb_ladder(rungs: Sequence[str], data_dirs, root: str, *, hours=None, toke
                 model, cfg = grow_model(parent, parent_cfg, target=cfg, device="cpu")
                 growth_diff = check_function_preserved(parent, model, parent_cfg, "cpu", verbose=verbose)
                 check_growth_trainable(model, parent_cfg, verbose=verbose)
+                prev_latest = os.path.join(prev_dir, "ckpt_latest.pt")
+                if os.path.exists(prev_latest):
+                    prev_opt_state = load_checkpoint(prev_latest, "cpu").get("optimizer_state_dict")
+                    if prev_opt_state is not None:
+                        init_opt_fn = lambda new_opt, pm=parent, pos=prev_opt_state, nm=model: (  # noqa: E731
+                            grow_optimizer_state(pm, pos, nm, new_opt))
                 say(f"[ladder] grew {parent_cfg.n_params() / 1e6:.2f}M -> {cfg.n_params() / 1e6:.2f}M "
                     f"(function preserved, new capacity trainable)")
         model.to(dev)
@@ -164,7 +171,7 @@ def climb_ladder(rungs: Sequence[str], data_dirs, root: str, *, hours=None, toke
                 setattr(tc, k, v)
 
         trainer = Trainer(model, tc, plan, data_dirs, run_dir, data_weights=data_weights, device=dev,
-                          callbacks=callbacks)
+                          callbacks=callbacks, init_optimizer=init_opt_fn)
         res = trainer.fit(resume=True)
         r = RungResult(rung=name, params=cfg.n_params(), status=res["status"], steps=res["step"],
                        tokens_seen=res["tokens_seen"], best_val_loss=res["best_val_loss"],

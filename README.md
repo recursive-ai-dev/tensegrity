@@ -67,15 +67,19 @@ Growth works along four axes (depth, FFN width, residual width/heads, context le
 ## Architecture
 
 ```
-bytes ─► embedding (tied with the output head) ─► [ByteMix: causal FIR over the previous K-1 byte embeddings]
-      ─► N × Block ─► RMSNorm ─► logits (soft-capped)            └► confidence head (stop-gradient probe)
+bytes ─► embedding (tied with the output head) ─► [ByteMix: causal FIR + gated bilinear n-gram mixer over K-1 bytes]
+      ─► (n_loops × N) × Block ─► RMSNorm ─► logits (soft-capped)    └► confidence head (stop-gradient probe)
 
-Block:  x ← x + g_attn · Attn(RMSNorm(x))        Attn = GQA, RoPE, Q/K-RMSNorm;
-        x ← x + g_ffn  · SwiGLU(RMSNorm(x))             layer i is GLOBAL causal iff (i+1) % 3 == 0, else a
-                                                        256-byte sliding window ("banded", one fused SDPA call)
+Block:  x ← x + g_x0   · x0                          Attn = GQA, RoPE, Q/K-RMSNorm, v0 value residual;
+        x ← x + g_attn · Attn(RMSNorm(x), v0)               layer i is GLOBAL causal iff (i+1) % 3 == 0, else a
+        x ← x + g_ffn  · SwiGLU(RMSNorm(x))                 256-byte sliding window ("banded", one fused SDPA call)
 ```
 
-* **Learnable residual gains** (`g_attn`, `g_ffn`, init 1/√(2L)) plus an activation-RMS **"homeostasis" loss** that nudges each sublayer's output RMS towards a set-point.
+* **Low-parameter expressivity (`ByteMix` bilinear n-grams, `x0_mix`, `v0_mix`, `n_loops`)**:
+  * **Gated bilinear `ByteMix`** (`byte_mix_bilinear=True`) augments the causal FIR filter with elementwise multiplicative byte-pair interactions `(w_j + bi_j · tanh(e_t / scale)) ⊙ e_{t-j}`, giving Layer 0 direct n-gram selectivity at `<0.04%` parameter cost while staying strictly channel-local (exact under width growth).
+  * **Value residual (`v0_mix=True`)** and **embedding re-injection (`x0_mix=True`)** route Layer 0's value projections `v0` and byte embeddings `x0` into every block via learnable gains (`n_kv_head` and `1` parameter per block).
+  * **Recursive block looping (`n_loops >= 1`)** executes the block stack `n_loops` times with per-pass residual gains (`loop_attn_gains`, `loop_ffn_gains`, `loop_x0_gains`), multiplying effective compositional depth with almost zero extra parameters and supporting function-preserving loop growth (`grow_model(..., new_n_loops=...)`).
+* **Learnable residual gains** (`g_attn`, `g_ffn`, init 1/√(2·L·n_loops)) plus an activation-RMS **"homeostasis" loss** that nudges each sublayer's output RMS towards a set-point.
 * **Banded local attention** is computed as one fused call — queries are cut into window-sized chunks that attend to a `[previous | current]` key strip under a band mask, with chunks folded into the batch dimension. It equals dense masked attention exactly (tested against a dense reference, forward and backward) and replaces the original Python loop of per-chunk kernels.
 * **GQA** uses SDPA's native `enable_gqa` only where it reaches the FlashAttention kernel (Ampere+, fp16/bf16). On a T4 the memory-efficient kernel has no GQA support, so K/V are expanded instead — otherwise SDPA silently falls back to the O(T²)-memory math kernel.
 * **LayerDrop** draws all layer-skip decisions from a private CPU generator once per forward — no GPU sync, no per-block collective, identical across DDP ranks, and checkpointable.

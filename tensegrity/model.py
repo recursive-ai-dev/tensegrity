@@ -38,7 +38,9 @@ class TensegrityLM(nn.Module):
         if cfg.byte_mix_kernel:
             if cfg.vocab_size <= ByteTokenizer.PAD:
                 raise ValueError("byte_mix_kernel needs vocab_size > PAD id (258)")
-            self.byte_mix = ByteMix(cfg.byte_mix_kernel, cfg.n_embd)
+            self.byte_mix = ByteMix(cfg.byte_mix_kernel, cfg.n_embd,
+                                    bilinear=cfg.byte_mix_bilinear, init_std=cfg.init_std,
+                                    embed_scale=cfg.embed_scale)
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg, i) for i in range(cfg.n_layer)])
         self.ln_f = RMSNorm(cfg.n_embd, cfg.norm_eps)
@@ -157,21 +159,27 @@ class TensegrityLM(nn.Module):
         x = x0
         x0_arg = x0 if self.cfg.x0_mix else None
         cos_all, sin_all = self._rope_tables(idx.device)
-        cos, sin = cos_all[:T], sin_all[:T]
+        cos = cos_all[:T].view(1, 1, T, -1)
+        sin = sin_all[:T].view(1, 1, T, -1)
 
         plan = self._layerdrop_plan()
         use_ckpt = self.grad_checkpoint and self.training and x.requires_grad
         total_homeo = x.new_zeros((), dtype=torch.float32)
         n_active = 0
-        for i, block in enumerate(self.blocks):
-            if plan[i]:
-                continue
-            if use_ckpt and i % self.grad_checkpoint_every == 0:
-                x, homeo = torch.utils.checkpoint.checkpoint(block, x, cos, sin, x0_arg, use_reentrant=False)
-            else:
-                x, homeo = block(x, cos, sin, x0_arg)
-            total_homeo = total_homeo + homeo
-            n_active += 1
+        v0: Optional[torch.Tensor] = None
+        need_v0_flag = self.cfg.v0_mix
+        for loop_idx in range(self.cfg.n_loops):
+            for i, block in enumerate(self.blocks):
+                if plan[i]:
+                    continue
+                need_v0 = need_v0_flag and v0 is None
+                if use_ckpt and i % self.grad_checkpoint_every == 0:
+                    x, homeo, v0 = torch.utils.checkpoint.checkpoint(
+                        block._forward_impl, x, cos, sin, x0_arg, v0, loop_idx, need_v0, use_reentrant=False)
+                else:
+                    x, homeo, v0 = block._forward_impl(x, cos, sin, x0_arg, v0, loop_idx, need_v0)
+                total_homeo = total_homeo + homeo
+                n_active += 1
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -185,13 +193,14 @@ class TensegrityLM(nn.Module):
             return logits, None, confidence
 
         cfg = self.cfg
-        ce_loss = F.cross_entropy(logits.float().view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+        logits_f = logits.float()
+        ce_loss = F.cross_entropy(logits_f.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
         avg_homeo = total_homeo / max(1, n_active * 2)
         total = ce_loss + cfg.homeo_weight * avg_homeo
         losses: Dict[str, torch.Tensor] = {"ce_loss": ce_loss, "homeo_loss": avg_homeo}
 
         if cfg.z_loss_weight > 0.0:
-            z = cfg.z_loss_weight * torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+            z = cfg.z_loss_weight * torch.logsumexp(logits_f, dim=-1).pow(2).mean()
             losses["z_loss"] = z
             total = total + z
 
@@ -227,19 +236,30 @@ class TensegrityLM(nn.Module):
         B, T = idx.shape
         if pos_start + T > self.cfg.block_size:
             raise ValueError(f"positions [{pos_start}, {pos_start + T}) exceed block_size {self.cfg.block_size}")
+        n_total = len(self.blocks) * self.cfg.n_loops
         if past_kv_list is None:
-            past_kv_list = [None] * len(self.blocks)
+            past_kv_list = [None] * n_total
 
         x0 = self._embed(idx, ctx)
         x = x0
         x0_arg = x0 if self.cfg.x0_mix else None
         cos_all, sin_all = self._rope_tables(idx.device)
-        cos, sin = cos_all[pos_start:pos_start + T], sin_all[pos_start:pos_start + T]
+        cos = cos_all[pos_start:pos_start + T].view(1, 1, T, -1)
+        sin = sin_all[pos_start:pos_start + T].view(1, 1, T, -1)
 
         new_past: List[KV] = []
-        for block, past in zip(self.blocks, past_kv_list):
-            x, kv = block.forward_incremental(x, cos, sin, x0_arg, past)
-            new_past.append(kv)
+        v0: Optional[torch.Tensor] = None
+        need_v0_flag = self.cfg.v0_mix
+        kv_idx = 0
+        for loop_idx in range(self.cfg.n_loops):
+            for block in self.blocks:
+                past = past_kv_list[kv_idx]
+                kv_idx += 1
+                if need_v0_flag and v0 is None:
+                    x, kv, v0 = block.forward_incremental(x, cos, sin, x0_arg, past, v0=None, loop_idx=loop_idx, return_v0=True)
+                else:
+                    x, kv = block.forward_incremental(x, cos, sin, x0_arg, past, v0=v0, loop_idx=loop_idx, return_v0=False)
+                new_past.append(kv)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)

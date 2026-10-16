@@ -19,7 +19,7 @@ from .colab import (download_to_browser, free_disk_gb, get_secret, in_colab, in_
                     project_dir, push_to_hub, runtime_summary)
 from .export import (export_safetensors, load_safetensors, quantize_int8_dynamic, write_model_card)
 from .growth import (check_function_preserved, check_growth_trainable, compute_fisher_diagonal,
-                     expand_reference_state, ewc_penalty, grow_model, make_ewc_loss, retarget)
+                     expand_reference_state, ewc_penalty, grow_model, grow_optimizer_state, make_ewc_loss, retarget)
 from .hw import (autotune_micro_batch, gpu_info, measure_throughput, mfu, pick_device, pick_dtype)
 from .ladder import RungResult, climb_ladder
 from .model import TensegrityLM

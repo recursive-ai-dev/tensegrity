@@ -96,15 +96,38 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                 loss = closure()
         for group in self.param_groups:
             if group["use_muon"]:
+                lr, beta, wd = group["lr"], group["momentum"], group["weight_decay"]
+                buckets: Dict[Tuple[Any, ...], List[nn.Parameter]] = {}
                 for p in group["params"]:
                     if p.grad is None:
                         continue
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    if p.ndim == 2:
+                        buckets.setdefault((p.shape, p.device, p.dtype), []).append(p)
+                    else:
+                        update = muon_update(p.grad, state["momentum_buffer"], beta=beta)
+                        if wd != 0.0:
+                            p.mul_(1 - lr * wd)
+                        p.add_(update.reshape(p.shape), alpha=-lr)
+                for (shape, _, _), params in buckets.items():
+                    if len(params) == 1:
+                        p = params[0]
+                        update = muon_update(p.grad, self.state[p]["momentum_buffer"], beta=beta)
+                        if wd != 0.0:
+                            p.mul_(1 - lr * wd)
+                        p.add_(update.reshape(shape), alpha=-lr)
+                    else:
+                        grads = [p.grad for p in params]
+                        bufs = [self.state[p]["momentum_buffer"] for p in params]
+                        torch._foreach_lerp_(bufs, grads, 1.0 - beta)
+                        stacked = torch.stack([torch.lerp(g, m, beta) for g, m in zip(grads, bufs)], dim=0)
+                        orth = zeropower_via_newtonschulz5(stacked, steps=5)
+                        scale = max(1.0, shape[-2] / shape[-1]) ** 0.5
+                        if wd != 0.0:
+                            torch._foreach_mul_(params, 1.0 - lr * wd)
+                        torch._foreach_add_(params, list(orth.unbind(0)), alpha=-lr * scale)
             else:
                 for p in group["params"]:
                     if p.grad is None:
@@ -117,7 +140,8 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     state["step"] += 1
                     update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                          state["step"], group["betas"], group["eps"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    if group["weight_decay"] != 0.0:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
         return loss
 
@@ -134,9 +158,10 @@ def configure_optimizer(model: nn.Module, weight_decay: float, learning_rate: fl
                         betas: Tuple[float, float], device_type: str,
                         use_8bit: bool = False, use_muon: bool = False,
                         muon_lr: float = 0.02, muon_momentum: float = 0.95,
-                        muon_weight_decay: float = None) -> torch.optim.Optimizer:
+                        muon_weight_decay: float = None,
+                        scalar_lr_mult: float = 3.0) -> torch.optim.Optimizer:
     """
-    AdamW (default): >=2-D weights are decayed; norms, scalars (residual gains, x0 gains),
+    AdamW (default): >=2-D weights are decayed; norms, scalars (residual gains, x0/v0 gains),
     biases and ByteMix taps are not.
 
     use_muon=True: every >=2-D weight inside ``model.blocks`` (attention + SwiGLU matrices) is
@@ -146,6 +171,9 @@ def configure_optimizer(model: nn.Module, weight_decay: float, learning_rate: fl
     remainder), so a parameter added to the model later can never silently fall through.
 
     muon_weight_decay: decoupled decay for the Muon group (default: ``weight_decay``).
+    scalar_lr_mult: multiplier applied to ``learning_rate`` for the non-decayed auxiliary
+        group (norms, residual gains, ByteMix taps) when ``use_muon=True``, so O(1)-scale
+        gates/taps keep pace with the orthogonalised Muon steps.
     """
     seen = set()
 
@@ -163,10 +191,11 @@ def configure_optimizer(model: nn.Module, weight_decay: float, learning_rate: fl
         decay = take(p for p in model.parameters() if not _is_no_decay(p))
         no_decay = take(model.parameters())
         mwd = weight_decay if muon_weight_decay is None else muon_weight_decay
+        nd_lr = min(muon_lr, learning_rate * scalar_lr_mult)
         groups = [
             dict(params=muon_params, lr=muon_lr, momentum=muon_momentum, weight_decay=mwd, use_muon=True),
             dict(params=decay, lr=learning_rate, betas=betas, eps=1e-10, weight_decay=weight_decay, use_muon=False),
-            dict(params=no_decay, lr=learning_rate, betas=betas, eps=1e-10, weight_decay=0.0, use_muon=False),
+            dict(params=no_decay, lr=nd_lr, betas=betas, eps=1e-10, weight_decay=0.0, use_muon=False),
         ]
         return SingleDeviceMuonWithAuxAdam([g for g in groups if g["params"]])
 

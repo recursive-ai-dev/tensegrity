@@ -54,7 +54,8 @@ def cmd_train(args) -> None:
 
     saved = load_run_plan(args.out_dir)
     overrides = {k: getattr(args, k) for k in ("dropout", "block_size", "sliding_window", "layerdrop_max",
-                                               "byte_mix_kernel", "x0_mix", "homeo_weight")
+                                               "byte_mix_kernel", "byte_mix_bilinear", "x0_mix", "v0_mix",
+                                               "n_loops", "homeo_weight")
                  if getattr(args, k, None) is not None}
     if saved is not None and args.resume:
         plan, tc, cfg = saved
@@ -182,9 +183,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", default="auto", choices=["auto", "float32", "bfloat16", "float16"])
     p.add_argument("--seed", type=int, default=1337)
     for name, typ in (("dropout", float), ("block_size", int), ("sliding_window", int), ("layerdrop_max", float),
-                      ("byte_mix_kernel", int), ("homeo_weight", float)):
+                      ("byte_mix_kernel", int), ("n_loops", int), ("homeo_weight", float)):
         p.add_argument(f"--{name}", type=typ, default=None)
-    p.add_argument("--x0_mix", type=_bool, default=None)
+    for bname in ("x0_mix", "v0_mix", "byte_mix_bilinear"):
+        p.add_argument(f"--{bname}", type=_bool, default=None)
     p.set_defaults(fn=cmd_train, resume=True)
 
     p = sub.add_parser("generate", help="sample text from a checkpoint")

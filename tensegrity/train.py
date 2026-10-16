@@ -327,7 +327,8 @@ class Trainer:
     def __init__(self, model: TensegrityLM, tc: TrainConfig, plan: RunPlan, data_dirs, out_dir: str,
                  data_weights: Optional[Sequence[float]] = None, device: str = "auto",
                  extra_loss: Optional[Callable[[nn.Module], torch.Tensor]] = None,
-                 callbacks: Optional[Sequence[Callback]] = None):
+                 callbacks: Optional[Sequence[Callback]] = None,
+                 init_optimizer: Optional[Callable[[torch.optim.Optimizer], None]] = None):
         self.model = model
         self._raw = model
         self._log_file = None
@@ -339,6 +340,7 @@ class Trainer:
         self.device_arg = device
         self.extra_loss = extra_loss
         self.callbacks: List[Callback] = list(callbacks or [])
+        self.init_optimizer = init_optimizer
         self.history: List[Dict[str, Any]] = []
         self.best_val_loss = float("inf")
         self.best_source = "raw"
@@ -492,8 +494,11 @@ class Trainer:
                 self.ema = EMA(self.raw_model, tc.ema_decay)  # checkpoint had no EMA: start averaging now
             self._print(f"[resume] {latest} -> continuing at step {start_step} "
                         f"({self.tokens_seen / 1e6:.1f}M tokens seen, best_val {self.best_val_loss:.4f})")
-        elif resume:
-            self._print(f"[resume] no checkpoint at {latest}; starting from scratch")
+        else:
+            if self.init_optimizer is not None:
+                self.init_optimizer(self.optimizer)
+            if resume:
+                self._print(f"[resume] no checkpoint at {latest}; starting from scratch")
 
         compiled = self.model
         if tc.compile:

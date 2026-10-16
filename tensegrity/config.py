@@ -75,7 +75,10 @@ class TensegrityConfig:
     norm_eps: float = 1e-6          # eps of the model-width RMSNorms (ln1/ln2/ln_f)
     confidence_detach: bool = False  # True: confidence head is a stop-gradient probe
     byte_mix_kernel: int = 0        # K>=2: learned causal FIR over the previous K-1 byte embeddings
+    byte_mix_bilinear: bool = False  # gated bilinear n-gram interaction inside ByteMix
     x0_mix: bool = False            # per-layer learnable re-injection of the embedding stream
+    v0_mix: bool = False            # per-layer learnable mixing of layer 0's value projection
+    n_loops: int = 1                # number of recursive passes through the block stack (>=1)
 
     # --------------------------------------------------------------- validate
     def __post_init__(self) -> None:
@@ -87,6 +90,8 @@ class TensegrityConfig:
             raise ValueError(f"n_head ({self.n_head}) must be divisible by n_kv_head ({self.n_kv_head})")
         if self.n_layer < 1:
             raise ValueError(f"n_layer must be >= 1, got {self.n_layer}")
+        if self.n_loops < 1:
+            raise ValueError(f"n_loops must be >= 1, got {self.n_loops}")
         if self.global_every < 1:
             raise ValueError(f"global_every must be >= 1, got {self.global_every}")
         if self.grad_checkpoint_every < 1:
@@ -100,7 +105,7 @@ class TensegrityConfig:
         if self.norm_eps <= 0:
             raise ValueError(f"norm_eps must be > 0, got {self.norm_eps}")
         if self.gain_init is None:
-            self.gain_init = 1.0 / math.sqrt(2.0 * self.n_layer)
+            self.gain_init = 1.0 / math.sqrt(2.0 * self.n_layer * self.n_loops)
 
     # ------------------------------------------------------------ constructors
     @classmethod
@@ -124,7 +129,7 @@ class TensegrityConfig:
     def replace(self, **overrides: Any) -> "TensegrityConfig":
         """Copy with field overrides. ``gain_init`` is recomputed unless given explicitly."""
         d = self.to_dict()
-        if "gain_init" not in overrides and "n_layer" in overrides:
+        if "gain_init" not in overrides and ("n_layer" in overrides or "n_loops" in overrides):
             d["gain_init"] = None
         d.update(overrides)
         return TensegrityConfig(**d)
@@ -160,11 +165,16 @@ class TensegrityConfig:
             per_block += 2 * hd
         if self.x0_mix:
             per_block += 1
+        if self.n_loops > 1:
+            per_block += (self.n_loops - 1) * (2 + (1 if self.x0_mix else 0))
         total = self.vocab_size * d + self.n_layer * per_block + d  # embedding + blocks + ln_f
+        if self.v0_mix and self.n_layer > 1:
+            total += (self.n_layer - 1) * self.n_kv_head
         if self.use_confidence_head:
             total += d + 1
         if self.byte_mix_kernel:
-            total += (self.byte_mix_kernel - 1) * d
+            n_taps = (self.byte_mix_kernel - 1) * d
+            total += n_taps * (2 if self.byte_mix_bilinear else 1)
         return total
 
     def n_params_non_embedding(self) -> int:
@@ -185,12 +195,13 @@ class TensegrityConfig:
         for i in range(self.n_layer):
             keys = keys_global if self.is_global_layer(i) else keys_local
             attn += 4.0 * keys * q_out        # QK^T and AV, 2 FLOPs per MAC
-        fwd = 2.0 * (self.n_layer * proj + self.vocab_size * d) + attn
+        fwd = 2.0 * (self.n_loops * self.n_layer * proj + self.vocab_size * d) + self.n_loops * attn
         return fwd * (3.0 if training else 1.0)
 
     def describe(self) -> str:
         n = self.n_params()
         kinds = "".join("G" if self.is_global_layer(i) else "l" for i in range(self.n_layer))
-        return (f"{n / 1e6:.2f}M params | L={self.n_layer} d={self.n_embd} "
+        loops = f"x{self.n_loops}" if self.n_loops > 1 else ""
+        return (f"{n / 1e6:.2f}M params | L={self.n_layer}{loops} d={self.n_embd} "
                 f"heads={self.n_head}/{self.n_kv_head}kv (hd={self.head_dim}) ffn={self.ffn_hidden} "
                 f"ctx={self.block_size} win={self.sliding_window} layers[{kinds}]")

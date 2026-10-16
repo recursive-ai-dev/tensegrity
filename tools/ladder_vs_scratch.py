@@ -32,8 +32,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 def run_arm(job: Dict[str, Any]) -> Dict[str, Any]:
     import torch
     torch.set_num_threads(1)
-    from tensegrity import (TensegrityLM, TrainConfig, Trainer, evaluate, get_preset_config, grow_model, load_model,
-                            make_plan, retarget, check_function_preserved, check_growth_trainable)
+    from tensegrity import (TensegrityLM, TrainConfig, Trainer, evaluate, get_preset_config, grow_model,
+                            grow_optimizer_state, load_checkpoint, load_model, make_plan, retarget,
+                            check_function_preserved, check_growth_trainable)
     ovr = dict(block_size=job["ctx"], sliding_window=job["ctx"] // 4)
     B, T = job["batch"], job["ctx"]
     opt = job["optimizer"]
@@ -67,7 +68,10 @@ def run_arm(job: Dict[str, Any]) -> Dict[str, Any]:
             check_growth_trainable(big, pcfg, verbose=False)
             v_parent = evaluate(parent, job["data"], pcfg, "cpu", torch.float32, 24, 16)["bpb"]
             v_grown = evaluate(big, job["data"], bcfg, "cpu", torch.float32, 24, 16)["bpb"]
-            r2 = Trainer(big, tc(), plan(job["n2"]), job["data"], os.path.join(d, "big"), device="cpu").fit(resume=False)
+            prev_opt = load_checkpoint(os.path.join(d, "small", "ckpt_latest.pt"), "cpu").get("optimizer_state_dict")
+            init_opt = (lambda new_opt: grow_optimizer_state(parent, prev_opt, big, new_opt)) if prev_opt else None
+            r2 = Trainer(big, tc(), plan(job["n2"]), job["data"], os.path.join(d, "big"), device="cpu",
+                         init_optimizer=init_opt).fit(resume=False)
             out.update(val_bpb=r2["best_val_loss"] / math.log(2), stage1_bpb=r1["best_val_loss"] / math.log(2),
                        parent_bpb=v_parent, grown_bpb=v_grown)
     out["secs"] = time.time() - t0

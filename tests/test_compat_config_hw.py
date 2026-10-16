@@ -79,10 +79,11 @@ def test_load_checkpoint_rejects_garbage(tmp_path):
 # ------------------------------------------------------------------------------------ config
 def test_config_from_dict_old_and_unknown_keys():
     d = small_cfg().to_dict()
-    for k in ("norm_eps", "confidence_detach", "byte_mix_kernel", "x0_mix"):
+    for k in ("norm_eps", "confidence_detach", "byte_mix_kernel", "byte_mix_bilinear", "x0_mix", "v0_mix", "n_loops"):
         d.pop(k)                                   # a v1 dict has none of the v2 fields
     cfg = TensegrityConfig.from_dict(d)
-    assert (cfg.norm_eps, cfg.confidence_detach, cfg.byte_mix_kernel, cfg.x0_mix) == (1e-6, False, 0, False)
+    assert (cfg.norm_eps, cfg.confidence_detach, cfg.byte_mix_kernel, cfg.byte_mix_bilinear,
+            cfg.x0_mix, cfg.v0_mix, cfg.n_loops) == (1e-6, False, 0, False, False, False, 1)
     d["future_field"] = 1
     with pytest.warns(UserWarning, match="future_field"):
         TensegrityConfig.from_dict(d)
@@ -91,7 +92,7 @@ def test_config_from_dict_old_and_unknown_keys():
 
 
 @pytest.mark.parametrize("bad", [dict(n_embd=50), dict(n_head=5, n_kv_head=2), dict(n_embd=36, n_head=4, n_kv_head=2),
-                                 dict(n_layer=0), dict(global_every=0), dict(layerdrop_max=1.0),
+                                 dict(n_layer=0), dict(n_loops=0), dict(global_every=0), dict(layerdrop_max=1.0),
                                  dict(sliding_window=0), dict(byte_mix_kernel=1), dict(norm_eps=0.0)])
 def test_config_validation(bad):
     with pytest.raises((ValueError, ZeroDivisionError)):
@@ -101,6 +102,7 @@ def test_config_validation(bad):
 def test_config_replace_recomputes_gain_init():
     c = small_cfg(n_layer=4)
     assert c.replace(n_layer=8).gain_init == pytest.approx(1 / (2 * 8) ** 0.5)
+    assert c.replace(n_loops=2).gain_init == pytest.approx(1 / (2 * 4 * 2) ** 0.5)
     assert c.replace(dropout=0.1).gain_init == c.gain_init
 
 

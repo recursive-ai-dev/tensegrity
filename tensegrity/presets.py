@@ -51,8 +51,9 @@ LADDER_COMMON: Dict[str, Any] = dict(
     block_size=1024, sliding_window=256, global_every=3, ffn_align=32,
     layerdrop_max=0.0, grad_checkpoint=False,
     use_qk_norm=True, embed_scale=False, logit_soft_cap=30.0, z_loss_weight=1e-4,
-    confidence_detach=True, byte_mix_kernel=4, x0_mix=False, homeo_weight=0.01,
-)  # embed_scale / byte_mix_kernel / optimizer choices: see tools/ablation_*.log and the README
+    confidence_detach=True, byte_mix_kernel=4, byte_mix_bilinear=True,
+    x0_mix=True, v0_mix=True, n_loops=1, homeo_weight=0.01,
+)  # embed_scale / byte_mix / x0_mix / v0_mix / optimizer choices: see tools/ablation_*.log and the README
 
 
 @dataclass(frozen=True)

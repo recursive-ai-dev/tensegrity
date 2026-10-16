@@ -64,12 +64,17 @@ def native_gqa_ok(t: torch.Tensor) -> bool:
 def _expand_kv(k: torch.Tensor, v: torch.Tensor, n_rep: int) -> Tuple[torch.Tensor, torch.Tensor]:
     if n_rep == 1:
         return k, v
-    return k.repeat_interleave(n_rep, dim=1), v.repeat_interleave(n_rep, dim=1)
+    B, Hkv, T, D = k.shape
+    return (k[:, :, None, :, :].expand(B, Hkv, n_rep, T, D).reshape(B, Hkv * n_rep, T, D),
+            v[:, :, None, :, :].expand(B, Hkv, n_rep, T, D).reshape(B, Hkv * n_rep, T, D))
 
 
 # =============================================================================
 # Normalisation, RoPE, small helpers
 # =============================================================================
+
+_HAS_FUSED_RMS_NORM: bool = hasattr(F, "rms_norm")
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -78,6 +83,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _HAS_FUSED_RMS_NORM:
+            w = self.weight if x.dtype == self.weight.dtype else self.weight.to(x.dtype)
+            return F.rms_norm(x, self.weight.shape, w, self.eps)
         in_dtype = x.dtype
         xf = x.float()
         rms = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
@@ -95,16 +103,19 @@ def precompute_rope(head_dim: int, max_seq_len: int, base: float = 10000.0,
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """x: (B, H, T, D). cos/sin: (>=T, D/2), row 0 aligned with x's first position."""
+    """x: (B, H, T, D). cos/sin: (>=T, D/2) or pre-shaped (1, 1, T, D/2)."""
     B, H, T, D = x.shape
     half = D // 2
-    assert T <= cos.shape[0], (
-        f"sequence length {T} exceeds RoPE table length {cos.shape[0]}; "
-        f"call precompute_rope with a larger max_seq_len")
+    if cos.ndim == 4:
+        c, s = cos, sin
+    else:
+        assert T <= cos.shape[0], (
+            f"sequence length {T} exceeds RoPE table length {cos.shape[0]}; "
+            f"call precompute_rope with a larger max_seq_len")
+        c = cos[:T].float().view(1, 1, T, half)
+        s = sin[:T].float().view(1, 1, T, half)
     xf = x.float()
     x1, x2 = xf[..., :half], xf[..., half:]
-    c = cos[:T].float().view(1, 1, T, half)
-    s = sin[:T].float().view(1, 1, T, half)
     return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1).to(x.dtype)
 
 
@@ -165,6 +176,8 @@ def local_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, wi
     Hkv = k.shape[1]
     W = window
     if T <= W:  # window covers everything -> plain causal attention
+        if n_rep > 1 and native_gqa_ok(q):
+            return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=True, enable_gqa=True)
         if n_rep > 1:
             k, v = _expand_kv(k, v, n_rep)
         return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=True)
@@ -172,17 +185,13 @@ def local_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, wi
     n_chunks = (T + W - 1) // W
     pad = n_chunks * W - T
     if pad:  # pad at the END: padded keys lie in the future of every real query, so are masked
-        q, k, v = (F.pad(t, (0, 0, 0, pad)) for t in (q, k, v))
+        q = F.pad(q, (0, 0, 0, pad))
+    kp = F.pad(k, (0, 0, W, pad)).view(B, Hkv, n_chunks + 1, W, D)
+    vp = F.pad(v, (0, 0, W, pad)).view(B, Hkv, n_chunks + 1, W, D)
+    k2 = torch.cat([kp[:, :, :-1], kp[:, :, 1:]], dim=3)       # (B, Hkv, nC, 2W, D)
+    v2 = torch.cat([vp[:, :, :-1], vp[:, :, 1:]], dim=3)
 
-    qc = q.reshape(B, H, n_chunks, W, D)
-    kc = k.reshape(B, Hkv, n_chunks, W, D)
-    vc = v.reshape(B, Hkv, n_chunks, W, D)
-    k_prev = torch.cat([torch.zeros_like(kc[:, :, :1]), kc[:, :, :-1]], dim=2)
-    v_prev = torch.cat([torch.zeros_like(vc[:, :, :1]), vc[:, :, :-1]], dim=2)
-    k2 = torch.cat([k_prev, kc], dim=3)                        # (B, Hkv, nC, 2W, D)
-    v2 = torch.cat([v_prev, vc], dim=3)
-
-    qf = qc.transpose(1, 2).reshape(B * n_chunks, H, W, D)
+    qf = q.view(B, H, n_chunks, W, D).transpose(1, 2).reshape(B * n_chunks, H, W, D)
     kf = k2.transpose(1, 2).reshape(B * n_chunks, Hkv, 2 * W, D)
     vf = v2.transpose(1, 2).reshape(B * n_chunks, Hkv, 2 * W, D)
     if n_rep > 1:
@@ -190,7 +199,7 @@ def local_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, wi
 
     mask = _band_mask(n_chunks, W, B, q.device)
     yf = F.scaled_dot_product_attention(qf, kf, vf, attn_mask=mask, dropout_p=dropout_p)
-    y = yf.reshape(B, n_chunks, H, W, D).transpose(1, 2).reshape(B, H, n_chunks * W, D)
+    y = yf.view(B, n_chunks, H, W, D).transpose(1, 2).reshape(B, H, n_chunks * W, D)
     return y[:, :, :T] if pad else y
 
 
@@ -198,7 +207,7 @@ class CausalSelfAttention(nn.Module):
     """GQA attention. ``is_global`` layers attend causally to everything; local layers to
     the trailing ``sliding_window`` positions."""
 
-    def __init__(self, cfg: TensegrityConfig, is_global: bool):
+    def __init__(self, cfg: TensegrityConfig, is_global: bool, layer_idx: int = 0):
         super().__init__()
         self.n_head = cfg.n_head
         self.n_kv_head = cfg.n_kv_head
@@ -218,25 +227,35 @@ class CausalSelfAttention(nn.Module):
         else:
             self.q_norm = None
             self.k_norm = None
+        if cfg.v0_mix and layer_idx > 0:
+            self.v0_gain = nn.Parameter(torch.full((cfg.n_kv_head,), 0.5))
+            self.v0_gain._no_decay = True  # type: ignore[attr-defined]
+        else:
+            self.v0_gain = None
 
-    def _project(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    def _project(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                 v0: Optional[torch.Tensor] = None):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v_raw = v
+        if self.v0_gain is not None and v0 is not None:
+            v = v + self.v0_gain.to(v.dtype).view(1, -1, 1, 1) * v0
         if self.q_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
-        return apply_rope(q, cos, sin), apply_rope(k, cos, sin), v
+        return apply_rope(q, cos, sin), apply_rope(k, cos, sin), v, v_raw
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                past: Optional[KV] = None, return_kv: bool = False):
+                past: Optional[KV] = None, return_kv: bool = False,
+                v0: Optional[torch.Tensor] = None, return_v0: bool = False):
         """
         Training / prefill (``past is None``): full-sequence attention starting at position 0.
         Decode (``past`` given): ``x`` must be ONE new token; its K/V are appended to ``past``.
         With ``return_kv`` the (trimmed) cache for subsequent decode steps is returned too.
         """
         B, T, _ = x.shape
-        q, k, v = self._project(x, cos, sin)
+        q, k, v, v_raw = self._project(x, cos, sin, v0)
         dropout_p = self.dropout_p if self.training else 0.0
 
         if past is not None:
@@ -261,10 +280,11 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim)
         y = self.resid_dropout(self.o_proj(y))
         if not return_kv:
-            return y
+            return (y, v_raw) if return_v0 else y
         if not self.is_global and k.shape[2] > self.sliding_window:
             k, v = k[:, :, -self.sliding_window:], v[:, :, -self.sliding_window:]
-        return y, (k.contiguous(), v.contiguous())
+        kv = (k.contiguous(), v.contiguous())
+        return (y, kv, v_raw) if return_v0 else (y, kv)
 
 
 # =============================================================================
@@ -299,12 +319,21 @@ class Block(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.ln1 = RMSNorm(cfg.n_embd, cfg.norm_eps)
-        self.attn = CausalSelfAttention(cfg, is_global=cfg.is_global_layer(layer_idx))
+        self.attn = CausalSelfAttention(cfg, is_global=cfg.is_global_layer(layer_idx), layer_idx=layer_idx)
         self.ln2 = RMSNorm(cfg.n_embd, cfg.norm_eps)
         self.ffn = SwiGLU(cfg.n_embd, cfg.ffn_hidden, cfg.bias, cfg.dropout)
         self.attn_gain = nn.Parameter(torch.tensor(float(cfg.gain_init)))
         self.ffn_gain = nn.Parameter(torch.tensor(float(cfg.gain_init)))
         self.x0_gain = nn.Parameter(torch.zeros(())) if cfg.x0_mix else None
+        if cfg.n_loops > 1:
+            n_extra = cfg.n_loops - 1
+            self.loop_attn_gains = nn.Parameter(torch.full((n_extra,), float(cfg.gain_init)))
+            self.loop_ffn_gains = nn.Parameter(torch.full((n_extra,), float(cfg.gain_init)))
+            self.loop_x0_gains = nn.Parameter(torch.zeros(n_extra)) if cfg.x0_mix else None
+        else:
+            self.loop_attn_gains = None
+            self.loop_ffn_gains = None
+            self.loop_x0_gains = None
         self.homeo_target = cfg.homeo_target
         self.track_homeo = cfg.homeo_weight > 0.0
         # depth-scaled stochastic-depth probability (consumed by TensegrityLM)
@@ -315,51 +344,94 @@ class Block(nn.Module):
             return (activation_rms(sub_out) - self.homeo_target).pow(2)
         return ref.new_zeros((), dtype=torch.float32)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                x0: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.x0_gain is not None:
-            x = x + self.x0_gain * x0
-        attn_out = self.attn(self.ln1(x), cos, sin)
+    def _gains(self, loop_idx: int):
+        if loop_idx == 0 or self.loop_attn_gains is None:
+            return self.attn_gain, self.ffn_gain, self.x0_gain
+        k = loop_idx - 1
+        xg = self.loop_x0_gains[k] if self.loop_x0_gains is not None else None
+        return self.loop_attn_gains[k], self.loop_ffn_gains[k], xg
+
+    def _forward_impl(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                      x0: Optional[torch.Tensor] = None, v0: Optional[torch.Tensor] = None,
+                      loop_idx: int = 0, need_v0: bool = False):
+        ag, fg, xg = self._gains(loop_idx)
+        if xg is not None and x0 is not None:
+            x = x + xg * x0
+        if need_v0:
+            attn_out, v0_out = self.attn(self.ln1(x), cos, sin, v0=v0, return_v0=True)
+        else:
+            attn_out, v0_out = self.attn(self.ln1(x), cos, sin, v0=v0), v0
         homeo = self._homeo(attn_out, x)
-        x = x + self.attn_gain * attn_out
+        x = x + ag * attn_out
         ffn_out = self.ffn(self.ln2(x))
         homeo = homeo + self._homeo(ffn_out, x)
-        x = x + self.ffn_gain * ffn_out
+        x = x + fg * ffn_out
+        return x, homeo, v0_out
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                x0: Optional[torch.Tensor] = None, v0: Optional[torch.Tensor] = None,
+                loop_idx: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        x, homeo, _ = self._forward_impl(x, cos, sin, x0, v0, loop_idx, need_v0=False)
         return x, homeo
 
     def forward_incremental(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                            x0: Optional[torch.Tensor], past: Optional[KV]
-                            ) -> Tuple[torch.Tensor, KV]:
+                            x0: Optional[torch.Tensor], past: Optional[KV],
+                            v0: Optional[torch.Tensor] = None, loop_idx: int = 0,
+                            return_v0: bool = False):
         """KV-cached forward for inference (eval mode; no LayerDrop, no homeostasis loss)."""
-        if self.x0_gain is not None:
-            x = x + self.x0_gain * x0
-        attn_out, kv = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True)
-        x = x + self.attn_gain * attn_out
-        x = x + self.ffn_gain * self.ffn(self.ln2(x))
-        return x, kv
+        ag, fg, xg = self._gains(loop_idx)
+        if xg is not None and x0 is not None:
+            x = x + xg * x0
+        if return_v0:
+            attn_out, kv, v0_out = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, v0=v0, return_v0=True)
+        else:
+            attn_out, kv = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, v0=v0)
+            v0_out = v0
+        x = x + ag * attn_out
+        x = x + fg * self.ffn(self.ln2(x))
+        return (x, kv, v0_out) if return_v0 else (x, kv)
 
 
 class ByteMix(nn.Module):
-    """Learned causal FIR filter over the previous K-1 byte embeddings:
+    """Learned causal FIR filter (and optional gated bilinear n-gram mixer) over the previous K-1 byte embeddings:
 
-        y_t = e_t + sum_{j=1..K-1} w_j * e_{t-j}        (w_j is a per-channel vector, init 0)
+        y_t = e_t + sum_{j=1..K-1} (w_j + bi_j * tanh(e_t / scale)) * e_{t-j}
 
     A byte is a fragment of a character/word, so the first layers of a byte LM spend
     capacity just assembling local n-grams. This gives every position direct, cheap
-    access to its recent bytes. Zero-initialised, so it starts as the identity.
+    access to its recent bytes and multiplicative byte-pair interactions. Zero-initialised,
+    so it starts as the identity and preserves function under width growth.
     """
 
-    def __init__(self, kernel: int, n_embd: int):
+    def __init__(self, kernel: int, n_embd: int, bilinear: bool = False,
+                 init_std: float = 0.02, embed_scale: bool = False):
         super().__init__()
         self.kernel = kernel
+        self.init_std = init_std
+        self.embed_scale = embed_scale
         self.weight = nn.Parameter(torch.zeros(kernel - 1, n_embd))
         self.weight._no_decay = True  # type: ignore[attr-defined]
+        if bilinear:
+            self.bi_weight = nn.Parameter(torch.zeros(kernel - 1, n_embd))
+            self.bi_weight._no_decay = True  # type: ignore[attr-defined]
+        else:
+            self.bi_weight = None
 
     def forward(self, e: torch.Tensor, n_prefix: int) -> torch.Tensor:
         """e: (B, n_prefix + T, C) embeddings whose first ``n_prefix`` (= K-1) rows are
         left context. Returns (B, T, C)."""
         T = e.shape[1] - n_prefix
-        out = e[:, n_prefix:]
+        cur = e[:, n_prefix:]
+        out = cur
+        w = self.weight if e.dtype == self.weight.dtype else self.weight.to(e.dtype)
+        if self.bi_weight is not None:
+            bw = self.bi_weight if e.dtype == self.bi_weight.dtype else self.bi_weight.to(e.dtype)
+            scale = self.init_std * (e.shape[-1] ** 0.5 if self.embed_scale else 1.0)
+            g = torch.tanh(cur * (1.0 / scale))
+            for j in range(1, self.kernel):
+                prev = e[:, n_prefix - j: n_prefix - j + T]
+                out = out + (w[j - 1] + bw[j - 1] * g) * prev
+            return out
         for j in range(1, self.kernel):
-            out = out + self.weight[j - 1] * e[:, n_prefix - j: n_prefix - j + T]
+            out = out + w[j - 1] * e[:, n_prefix - j: n_prefix - j + T]
         return out

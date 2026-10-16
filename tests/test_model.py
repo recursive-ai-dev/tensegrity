@@ -81,7 +81,7 @@ def test_native_gqa_gated_by_hardware():
 
 def test_model_is_causal_everywhere():
     torch.manual_seed(2)
-    m = randomized(TensegrityLM(small_cfg(byte_mix_kernel=4, x0_mix=True))).eval()
+    m = randomized(TensegrityLM(small_cfg(byte_mix_kernel=4, byte_mix_bilinear=True, x0_mix=True, v0_mix=True, n_loops=2))).eval()
     x = torch.randint(0, 256, (2, 40))
     base, _, _ = m(x)
     for t in (0, 7, 19, 33):
@@ -98,6 +98,7 @@ VARIANTS = [
     {"x0_mix": True},
     {"byte_mix_kernel": 3, "x0_mix": True, "use_qk_norm": False, "bias": True},
     {"logit_soft_cap": 30.0, "embed_scale": False},
+    {"byte_mix_kernel": 4, "byte_mix_bilinear": True, "x0_mix": True, "v0_mix": True, "n_loops": 2},
 ]
 
 
@@ -130,8 +131,10 @@ def test_cached_decode_matches_full_forward(variant):
         steps.append(logits)
     torch.testing.assert_close(torch.cat(steps, dim=1), full, atol=2e-5, rtol=1e-4)
     # local layers must only keep the trailing window
-    for blk, (k, v) in zip(m.blocks, past):
-        assert k.shape[2] == (cfg.block_size if blk.attn.is_global else cfg.sliding_window)
+    for l_idx in range(cfg.n_loops):
+        for blk_idx, blk in enumerate(m.blocks):
+            k, v = past[l_idx * len(m.blocks) + blk_idx]
+            assert k.shape[2] == (cfg.block_size if blk.attn.is_global else cfg.sliding_window)
 
 
 @pytest.mark.parametrize("variant", VARIANTS[:3])
@@ -343,6 +346,7 @@ def test_byte_mix_is_identity_at_init_and_uses_history():
 
 def test_param_counts_match_formula():
     for kw in [{}, {"bias": True}, {"use_qk_norm": False}, {"byte_mix_kernel": 4, "x0_mix": True},
+               {"byte_mix_kernel": 4, "byte_mix_bilinear": True, "x0_mix": True, "v0_mix": True, "n_loops": 3},
                {"use_confidence_head": False}, {"n_kv_head": 3}]:
         cfg = small_cfg(**kw)
         assert TensegrityLM(cfg).num_parameters() == cfg.n_params(), kw

@@ -9,15 +9,16 @@ import torch
 from conftest import randomized, small_cfg
 from tensegrity import (TensegrityLM, check_function_preserved, check_growth_trainable,
                         compute_fisher_diagonal, ewc_penalty, expand_reference_state, export_safetensors, grow_model,
-                        load_safetensors, make_ewc_loss, quantize_int8_dynamic, write_model_card)
+                        grow_optimizer_state, load_safetensors, make_ewc_loss, quantize_int8_dynamic, write_model_card)
 from tensegrity.growth import derive_target
 
 AXES = {
     "depth": dict(new_n_layer=6),
+    "loops": dict(new_n_loops=2),
     "ffn": dict(ffn_growth_mult=1.5),
     "width": dict(new_n_embd=96),
     "context": dict(new_block_size=96),
-    "everything": dict(new_n_layer=6, ffn_growth_mult=1.3, new_n_embd=96, new_block_size=96),
+    "everything": dict(new_n_layer=6, new_n_loops=2, ffn_growth_mult=1.3, new_n_embd=96, new_block_size=96),
 }
 
 
@@ -25,7 +26,7 @@ AXES = {
 @pytest.mark.parametrize("flags", [
     dict(),
     dict(embed_scale=False),
-    dict(bias=True, byte_mix_kernel=4, x0_mix=True),
+    dict(bias=True, byte_mix_kernel=4, byte_mix_bilinear=True, x0_mix=True, v0_mix=True),
     dict(logit_soft_cap=30.0, use_qk_norm=False, use_confidence_head=False),
 ])
 def test_growth_preserves_function_and_is_trainable(axis, flags):
@@ -143,14 +144,45 @@ def test_growth_is_reproducible_and_leaves_old_model_untouched():
 
 
 def test_grown_model_generates_identically_to_parent():
-    cfg = small_cfg()
+    cfg = small_cfg(byte_mix_kernel=4, byte_mix_bilinear=True, x0_mix=True, v0_mix=True)
     old = randomized(TensegrityLM(cfg)).eval()
-    new, _ = grow_model(old, cfg, new_n_layer=6, new_n_embd=96)
+    new, _ = grow_model(old, cfg, new_n_layer=6, new_n_embd=96, new_n_loops=2)
     new.eval()
     p = torch.randint(0, 256, (1, 6))
     a = old.generate(p, 20, temperature=0.0, stop_on_eos=False)
     b = new.generate(p, 20, temperature=0.0, stop_on_eos=False)
     assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("use_muon", [False, True])
+def test_grow_optimizer_state_transplants_moments_from_live_and_saved(use_muon):
+    torch.manual_seed(0)
+    cfg = small_cfg(byte_mix_kernel=4, byte_mix_bilinear=True, x0_mix=True, v0_mix=True)
+    old = TensegrityLM(cfg)
+    opt_old = old.configure_optimizer(0.1, 3e-3, (0.9, 0.95), "cpu", use_muon=use_muon)
+    x = torch.randint(0, 64, (4, 16))
+    _, losses, _ = old(x, x)
+    losses["total_loss"].backward()
+    opt_old.step()
+
+    new1, _ = grow_model(old, cfg, new_n_embd=96, new_n_layer=5)
+    opt_new1 = new1.configure_optimizer(0.1, 3e-3, (0.9, 0.95), "cpu", use_muon=use_muon)
+    n_live = grow_optimizer_state(old, opt_old, new1, opt_new1)
+    assert n_live == len(list(old.parameters()))
+
+    new2, _ = grow_model(old, cfg, new_n_embd=96, new_n_layer=5)
+    opt_new2 = new2.configure_optimizer(0.1, 3e-3, (0.9, 0.95), "cpu", use_muon=use_muon)
+    n_saved = grow_optimizer_state(old, opt_old.state_dict(), new2, opt_new2)
+    assert n_saved == n_live
+    # Transplanted old slices match between live and state_dict paths
+    for p1, p2 in zip(new1.parameters(), new2.parameters()):
+        s1, s2 = opt_new1.state[p1], opt_new2.state[p2]
+        assert set(s1) == set(s2)
+        for k in s1:
+            if isinstance(s1[k], torch.Tensor):
+                torch.testing.assert_close(s1[k], s2[k])
+            else:
+                assert s1[k] == s2[k]
 
 
 # ------------------------------------------------------------------------------------- EWC

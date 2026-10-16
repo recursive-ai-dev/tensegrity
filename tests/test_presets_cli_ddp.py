@@ -26,7 +26,8 @@ def test_preset_param_counts_match_their_names(name):
     assert abs(cfg.n_params() - TARGETS[name]) / TARGETS[name] < 0.02, cfg.describe()
     assert cfg.ffn_hidden == get_preset(name).ffn_hidden
     assert cfg.head_dim == 32 and cfg.gqa_ratio == 2
-    assert (cfg.byte_mix_kernel, cfg.embed_scale, cfg.x0_mix) == (4, False, False)   # ablation-chosen ladder defaults
+    assert (cfg.byte_mix_kernel, cfg.byte_mix_bilinear, cfg.embed_scale, cfg.x0_mix, cfg.v0_mix) == \
+           (4, True, False, True, True)   # ablation-chosen ladder defaults
 
 
 @pytest.mark.parametrize("name", LADDER_NAMES[:4])
