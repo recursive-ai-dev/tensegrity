@@ -79,11 +79,14 @@ class TensegrityLM(nn.Module):
     def summary(self) -> str:
         return f"{self.cfg.describe()} | counted {self.num_parameters():,} params"
 
-    def _rope_tables(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _rope_tables(self, device: torch.device, n: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin for at least ``max(block_size, n)`` positions (streaming decode asks for more)."""
         key = str(device)
+        need = max(self.cfg.block_size, n or 0)
         tabs = self._rope.get(key)
-        if tabs is None:
-            tabs = precompute_rope(self.cfg.head_dim, self.cfg.block_size, self.cfg.rope_base, device=device)
+        if tabs is None or tabs[0].shape[0] < need:
+            grown = need if tabs is None else max(need, 2 * tabs[0].shape[0])
+            tabs = precompute_rope(self.cfg.head_dim, grown, self.cfg.rope_base, device=device)
             self._rope[key] = tabs
         return tabs
 
@@ -223,6 +226,7 @@ class TensegrityLM(nn.Module):
                             past_kv_list: Optional[List[Optional[KV]]] = None,
                             pos_start: int = 0,
                             ctx: Optional[torch.Tensor] = None,
+                            streaming: bool = False,
                             ) -> Tuple[torch.Tensor, List[KV], Optional[torch.Tensor]]:
         """KV-cached forward for inference.
 
@@ -230,19 +234,29 @@ class TensegrityLM(nn.Module):
         * decode:  ``past_kv_list`` from the previous call, ``idx`` is ONE new token at
           absolute window position ``pos_start``; ``ctx`` = the K-1 tokens before it
           (needed only when ``byte_mix_kernel`` is set).
+        * ``streaming=True``: ``pos_start`` may run past ``block_size`` (absolute stream position); global
+          layers keep only their most recent ``block_size`` keys, so memory and per-token cost stay bounded.
+          RoPE is relative, so every retained key stays within the trained distance range of the query.
 
         Returns (logits, new_past_kv_list, confidence) for the T new positions.
         """
         B, T = idx.shape
-        if pos_start + T > self.cfg.block_size:
+        if not streaming and pos_start + T > self.cfg.block_size:
             raise ValueError(f"positions [{pos_start}, {pos_start + T}) exceed block_size {self.cfg.block_size}")
+<<<<<<< HEAD
         n_total = len(self.blocks) * self.cfg.n_loops
+=======
+        if streaming and T > self.cfg.block_size:
+            raise ValueError(f"a streaming step takes at most block_size={self.cfg.block_size} tokens, got {T}")
+        max_cache = self.cfg.block_size if streaming else None
+>>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
         if past_kv_list is None:
             past_kv_list = [None] * n_total
 
         x0 = self._embed(idx, ctx)
         x = x0
         x0_arg = x0 if self.cfg.x0_mix else None
+<<<<<<< HEAD
         cos_all, sin_all = self._rope_tables(idx.device)
         cos = cos_all[pos_start:pos_start + T].view(1, 1, T, -1)
         sin = sin_all[pos_start:pos_start + T].view(1, 1, T, -1)
@@ -260,6 +274,15 @@ class TensegrityLM(nn.Module):
                 else:
                     x, kv = block.forward_incremental(x, cos, sin, x0_arg, past, v0=v0, loop_idx=loop_idx, return_v0=False)
                 new_past.append(kv)
+=======
+        cos_all, sin_all = self._rope_tables(idx.device, pos_start + T)
+        cos, sin = cos_all[pos_start:pos_start + T], sin_all[pos_start:pos_start + T]
+
+        new_past: List[KV] = []
+        for block, past in zip(self.blocks, past_kv_list):
+            x, kv = block.forward_incremental(x, cos, sin, x0_arg, past, max_cache)
+            new_past.append(kv)
+>>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -312,12 +335,49 @@ class TensegrityLM(nn.Module):
             return torch.where(bad.unsqueeze(-1), fallback, sampled)
         return torch.multinomial(probs, 1)
 
+    def _generate_stream_iter(self, idx: torch.Tensor, max_new_tokens: int, temperature: float,
+                              top_k: Optional[int], top_p: Optional[float], min_p: Optional[float],
+                              use_confidence_temp: bool, conf_temp_min: float, conf_temp_max: float,
+                              stop_on_eos: bool) -> Iterator[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        """Streaming-cache decoding: one prefill, then O(1) work per token forever (see ``generate``)."""
+        bs, K = self.cfg.block_size, self.cfg.byte_mix_kernel
+        m = max(K - 1, 0)                                   # ByteMix needs the previous K-1 tokens
+        was_training = self.training
+        self.eval()
+        try:
+            B = idx.size(0)
+            finished = torch.zeros(B, dtype=torch.bool, device=idx.device) if stop_on_eos else None
+            window = idx[:, -bs:]
+            logits, past, conf = self.forward_incremental(window, None, 0, streaming=True)
+            pos = window.size(1)                            # absolute stream position of the next token
+            tail = window[:, -m:] if m else None
+            for step in range(max_new_tokens):
+                next_tok = self._sample_next(
+                    logits[:, -1, :], temperature, top_k, top_p, min_p,
+                    conf[:, -1] if (use_confidence_temp and conf is not None) else None, conf_temp_min, conf_temp_max)
+                if stop_on_eos:
+                    next_tok = torch.where(finished.unsqueeze(-1), torch.full_like(next_tok, ByteTokenizer.EOS), next_tok)
+                    finished = finished | (next_tok.squeeze(-1) == ByteTokenizer.EOS)
+                yield next_tok, (conf[:, -1] if conf is not None else None)
+                if (stop_on_eos and bool(finished.all())) or step == max_new_tokens - 1:
+                    break
+                logits, past, conf = self.forward_incremental(next_tok, past, pos, tail, streaming=True)
+                pos += 1
+                if m:
+                    tail = torch.cat([tail, next_tok], dim=1)[:, -m:]
+        finally:
+            self.train(was_training)
+
     def _generate_iter(self, idx: torch.Tensor, max_new_tokens: int, temperature: float,
                        top_k: Optional[int], top_p: Optional[float], min_p: Optional[float],
                        use_confidence_temp: bool, conf_temp_min: float, conf_temp_max: float,
-                       stop_on_eos: bool, use_cache: bool, rebuild_stride: int
+                       stop_on_eos: bool, use_cache: bool, rebuild_stride: int, cache_mode: str = "window"
                        ) -> Iterator[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Yield ``(next_tok (B,1), confidence (B,) | None)`` for each generated position."""
+        if cache_mode not in ("window", "streaming"):
+            raise ValueError(f"cache_mode must be 'window' or 'streaming', got {cache_mode!r}")
+        if cache_mode == "streaming" and not use_cache:
+            raise ValueError("cache_mode='streaming' needs use_cache=True")
         if temperature < 0.0:
             raise ValueError(f"temperature must be >= 0, got {temperature}")
         if top_k is not None and top_k <= 0:
@@ -328,6 +388,10 @@ class TensegrityLM(nn.Module):
         if not 1 <= rebuild_stride <= bs:
             raise ValueError(f"rebuild_stride must be in [1, block_size={bs}], got {rebuild_stride}")
         K = self.cfg.byte_mix_kernel
+        if cache_mode == "streaming":
+            yield from self._generate_stream_iter(idx, max_new_tokens, temperature, top_k, top_p, min_p,
+                                                  use_confidence_temp, conf_temp_min, conf_temp_max, stop_on_eos)
+            return
 
         was_training = self.training
         self.eval()
@@ -377,7 +441,7 @@ class TensegrityLM(nn.Module):
                  min_p: Optional[float] = None, use_confidence_temp: bool = False,
                  conf_temp_min: float = 0.5, conf_temp_max: float = 1.5,
                  stop_on_eos: bool = True, use_cache: bool = True, rebuild_stride: int = 1,
-                 return_confidence: bool = False):
+                 return_confidence: bool = False, cache_mode: str = "window"):
         """Autoregressive sampling.
 
         Returns ``(B, T + new)`` ids (shorter if every row hit EOS; finished rows are padded
@@ -389,11 +453,24 @@ class TensegrityLM(nn.Module):
             ``block_size``: 1 reproduces the non-cached "last block_size tokens" semantics
             exactly; a larger value amortises the re-prefill (slightly shorter effective
             context right after each rebuild).
+        cache_mode: what happens once prompt + output exceed ``block_size``.
+            ``"window"`` (default) keeps the exact semantics of an uncached model fed the last
+            ``block_size`` tokens: it re-prefills (O(block_size^2) work) as the window slides.
+            ``"streaming"`` never re-prefills: it keeps a bounded per-layer KV cache (global layers: the
+            last ``block_size`` keys; local layers: their window) at absolute RoPE positions, so each token
+            costs O(1). It is NOT equivalent after overflow, for two reasons: (1) the cached states of retained
+            tokens in layers above the first were computed while the tokens since dropped were still in view,
+            whereas "window" recomputes them from the truncated text; (2) with ByteMix, "window" re-encodes the
+            first tokens of its window from PAD left-context (as training windows start) while the cache holds
+            their true left context -- visible to global layers. It is exactly equivalent while everything fits,
+            and for a one-layer model whose attention does not reach the window start (any local layer; a global
+            layer without ByteMix); otherwise measure the gap with :func:`tensegrity.evaluation.long_stream_nll`
+            before relying on it.
         """
         toks, confs = [idx], []
         for next_tok, conf in self._generate_iter(
                 idx, max_new_tokens, temperature, top_k, top_p, min_p, use_confidence_temp,
-                conf_temp_min, conf_temp_max, stop_on_eos, use_cache, rebuild_stride):
+                conf_temp_min, conf_temp_max, stop_on_eos, use_cache, rebuild_stride, cache_mode):
             toks.append(next_tok)
             confs.append(conf)
         out = torch.cat(toks, dim=1)
@@ -409,7 +486,8 @@ class TensegrityLM(nn.Module):
         if idx.size(0) != 1:
             raise ValueError("stream() supports a single sequence (batch size 1)")
         kw = dict(temperature=1.0, top_k=None, top_p=None, min_p=None, use_confidence_temp=False,
-                  conf_temp_min=0.5, conf_temp_max=1.5, stop_on_eos=True, use_cache=True, rebuild_stride=1)
+                  conf_temp_min=0.5, conf_temp_max=1.5, stop_on_eos=True, use_cache=True, rebuild_stride=1,
+                  cache_mode="window")
         unknown = set(kwargs) - set(kw)
         if unknown:
             raise TypeError(f"stream() got unexpected keyword argument(s) {sorted(unknown)}")

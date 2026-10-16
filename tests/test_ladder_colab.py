@@ -30,6 +30,11 @@ def test_climb_ladder_trains_grows_and_resumes(corpus_dir, tmp_path):
     from tensegrity import load_model
     m2, c2, _ = load_model(os.path.join(r[1].run_dir, "ckpt_best.pt"))
     assert (c2.sliding_window, c2.block_size, c2.n_embd, c2.n_layer) == (16, 64, 192, 5)
+    # provenance: the grown rung's checkpoints name the exact parent checkpoint they started from
+    from tensegrity.checkpoint import load_checkpoint
+    from tensegrity.manifest import sha256_file
+    lin = load_checkpoint(os.path.join(r[1].run_dir, "ckpt_latest.pt"))["lineage"]
+    assert lin["grown_from"]["sha256"] == sha256_file(os.path.join(r[0].run_dir, "ckpt_best.pt")) and lin["rung"] == 1
     # calling again is a no-op: both rungs are recognised as finished
     again = climb_ladder(["1m", "2m"], corpus_dir, root, tc_overrides=TCO, **FAST)
     assert all(x.skipped for x in again) and again[1].best_val_loss == r[1].best_val_loss

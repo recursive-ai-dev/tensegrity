@@ -66,7 +66,7 @@ def load_safetensors(weights_path: str, config_path: Optional[str] = None, devic
         if raw is None:
             raise ValueError(f"{weights_path} has no embedded config; pass config_path=")
         cfg_dict = json.loads(raw)
-    cfg = TensegrityConfig.from_dict(cfg_dict)
+    cfg = TensegrityConfig.from_dict(cfg_dict, strict=True)
     model = TensegrityLM(cfg)
     state = load_file(weights_path)
     state.pop("lm_head.weight", None)  # tied to token_emb.weight
@@ -128,7 +128,7 @@ def write_model_card(out_dir: str, cfg: TensegrityConfig, name: str = "model",
         "from tensegrity import load_safetensors, ByteTokenizer", "import torch",
         f"model, cfg = load_safetensors('{name}.safetensors'); model.eval()",
         "tok = ByteTokenizer()",
-        "ids = torch.tensor([[tok.BOS] + tok.encode('Once upon a time')])",
+        "ids = torch.tensor([[tok.DOC_START] + tok.encode('Once upon a time')])",
         "out = model.generate(ids, max_new_tokens=200, temperature=0.8, top_k=40)",
         "print(tok.decode(out[0].tolist()))", "```", "",
         "## Limitations", "",
