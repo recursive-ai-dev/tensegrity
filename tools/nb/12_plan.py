@@ -49,6 +49,7 @@ if _saved is None:
 if _saved is None:                                  # new run: prove the optimizer path is numerically sound on THIS device
     TC = tg.preflight_or_fallback(model, TC, DEVICE)  # falls back to AdamW automatically if e.g. Muon misbehaves
 TC.max_minutes = STOP_AFTER_MINUTES or None         # per-session limit, never persisted
+LINEAGE = ({"init_from": tg.file_record(INIT_FROM_WEIGHTS)} if (INIT_FROM_WEIGHTS and _saved is None) else None)
 _epochs = PLAN.total_tokens / max(1, DATA_META["n_train_tokens"])
 print(f"model               : {CFG.describe()}")
 def _human(n):
@@ -58,3 +59,8 @@ print(f"training plan       : {PLAN.max_steps:,} steps x {PLAN.tokens_per_step:,
 print(f"schedule            : {PLAN.warmup_steps} warmup -> {PLAN.stable_steps:,} stable -> {PLAN.decay_steps:,} cool-down")
 if _epochs > 8:
     print("⚠️  This plan repeats your data many times; consider more data (§1) or fewer hours to avoid memorisation.")
+
+PREFLIGHT = tg.preflight_report(model, TC, PLAN, DATA_DIR, DEVICE)
+print("\n" + tg.format_preflight(PREFLIGHT))
+if not PREFLIGHT["ok"]:
+    raise RuntimeError("preflight found blockers (listed above); fix them before training")

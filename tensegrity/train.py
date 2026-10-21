@@ -22,19 +22,25 @@ import json
 import math
 import os
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from .checkpoint import capture_rng_state, load_checkpoint, restore_rng_state, save_checkpoint
+from . import manifest as M
+from .checkpoint import (capture_rng_state, environment_info, load_checkpoint, restore_rng_state, save_checkpoint,
+                         unwrap_model)
 from .config import TensegrityConfig
+from .continual import hook_info
 from .data import ByteDataset
+from .evaluation import EvalSuite, evaluate, evaluate_batches  # noqa: F401  (re-exported: tensegrity.train.evaluate*)
 from .hw import amp_settings, device_type_of, gpu_info, mfu, pick_device, pick_dtype, set_fast_matmul
 from .model import TensegrityLM
-from .schedule import RunPlan
+from .schedule import RunPlan, plan_change_problems
 from .tokenizer import ByteTokenizer
 
 Callback = Callable[[str, Dict[str, Any]], None]
@@ -165,42 +171,18 @@ class TrainConfig:
     # session used (a persisted ``max_minutes`` would stop every resume immediately).
     EPHEMERAL = ("max_minutes", "verbose")
 
+    # Fields that define the optimisation TRAJECTORY. An exact resume requires them to equal the
+    # checkpoint's; everything else (logging / eval / sampling cadence, dtype, compile, ...) may
+    # differ between sessions without changing what the run computes.
+    TRAJECTORY = ("batch_size", "grad_accum_steps", "block_size", "learning_rate", "min_lr", "optimizer",
+                  "weight_decay", "beta1", "beta2", "grad_clip", "muon_lr", "muon_momentum", "muon_weight_decay",
+                  "use_8bit_optimizer", "ema_decay", "seed")
+
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
 
     def persistent_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in self.to_dict().items() if k not in self.EPHEMERAL}
-
-
-# =============================================================================
-# Evaluation
-# =============================================================================
-
-@torch.no_grad()
-def evaluate_batches(model: nn.Module, batches: Sequence, device: str, dtype: torch.dtype) -> Dict[str, float]:
-    """Mean cross-entropy over fixed (x, y) batches -> loss (nats/byte), bits-per-byte, perplexity."""
-    amp = amp_settings(dtype, device)
-    was_training = model.training
-    model.eval()
-    try:
-        total = 0.0
-        for x, y in batches:
-            with torch.autocast(device_type=amp["autocast_device"], dtype=amp["amp_dtype"], enabled=amp["use_amp"]):
-                _, losses, _ = model(x, y)
-            total += float(losses["ce_loss"])
-        loss = total / len(batches)
-    finally:
-        model.train(was_training)
-    return {"loss": loss, "bpb": loss / math.log(2.0), "ppl": math.exp(min(loss, 50.0))}
-
-
-def evaluate(model: nn.Module, data_dir: str, cfg: TensegrityConfig, device: str, dtype: Optional[torch.dtype] = None,
-             n_batches: int = 20, batch_size: int = 16, split: str = "val") -> Dict[str, float]:
-    """Convenience: evaluate on a fixed set of windows from ``data_dir``."""
-    dtype = dtype or pick_dtype("auto", device)
-    ds = ByteDataset(data_dir)
-    batches = ds.fixed_batches(split, n_batches, batch_size, cfg.block_size, device)
-    return evaluate_batches(model, batches, device, dtype)
 
 
 # =============================================================================
@@ -309,7 +291,7 @@ def load_run_plan(out_dir: str):
         d = json.load(fh)
     known = {f.name for f in dataclasses.fields(TrainConfig)}
     return (RunPlan(**d["plan"]), TrainConfig(**{k: v for k, v in d["train_config"].items() if k in known}),
-            TensegrityConfig.from_dict(d["model_config"]))
+            TensegrityConfig.from_dict(d["model_config"], strict=True))
 
 
 class Trainer:
@@ -320,14 +302,32 @@ class Trainer:
     tc    : TrainConfig            plan : RunPlan (steps + LR schedule)
     data_dirs / data_weights : one or more prepared corpora (validation always uses data_dirs[0])
     out_dir : checkpoints (``ckpt_latest.pt`` full, ``ckpt_best.pt`` weights-only), ``train_log.jsonl``
-    extra_loss : optional ``fn(model) -> scalar tensor`` added to the loss (e.g. an EWC penalty)
+    extra_loss : optional ``fn(model) -> scalar tensor`` added to the loss (e.g. an :class:`~tensegrity.continual.EWCState`)
+    batch_loss : optional ``fn(model, x, y, logits) -> scalar tensor`` added to the loss; it sees the batch and the
+        student's logits (e.g. :class:`~tensegrity.continual.DistillLoss`). Hooks that expose ``fingerprint()`` are
+        verified on resume: continuing with a different EWC state or teacher is a policy change.
     callbacks : ``fn(event, payload)`` for events: start, log, eval, sample, checkpoint, end
+    eval_suite : an :class:`~tensegrity.evaluation.EvalSuite` of named domains. Without it validation uses
+        ``data_dirs[0]`` only. With it every domain is evaluated at each eval, the per-domain numbers are logged,
+        and the best checkpoint is chosen by the suite's macro-averaged loss; the suite's fingerprint is recorded and
+        checked on resume (best-checkpoint comparisons are only meaningful on the same evaluation set).
+    lineage : free-form provenance recorded in every checkpoint (e.g. ``{"init_from": ...}``, ``{"grown_from": ...}``)
+
+    Counters in a checkpoint (all explicit, none inferred):
+      * ``step`` == ``completed_updates``: loop iterations finished = the position on the LR schedule.
+        Resume continues AT this value; there is no off-by-one between periodic and final checkpoints.
+      * ``skipped_steps``: iterations whose update was withheld (non-finite loss/gradients, fp16 overflow);
+        ``applied_updates = completed_updates - skipped_steps`` optimizer updates actually applied.
+      * ``tokens_seen``: tokens consumed by forward/backward passes (skipped iterations still consume data).
     """
 
     def __init__(self, model: TensegrityLM, tc: TrainConfig, plan: RunPlan, data_dirs, out_dir: str,
                  data_weights: Optional[Sequence[float]] = None, device: str = "auto",
                  extra_loss: Optional[Callable[[nn.Module], torch.Tensor]] = None,
-                 callbacks: Optional[Sequence[Callback]] = None,
+                 callbacks: Optional[Sequence[Callback]] = None, *,
+                 lineage: Optional[Dict[str, Any]] = None,
+                 batch_loss: Optional[Callable[[nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+                 eval_suite: Optional[EvalSuite] = None,
                  init_optimizer: Optional[Callable[[torch.optim.Optimizer], None]] = None):
         self.model = model
         self._raw = model
@@ -339,6 +339,9 @@ class Trainer:
         self.out_dir = out_dir
         self.device_arg = device
         self.extra_loss = extra_loss
+        self.batch_loss = batch_loss
+        self.eval_suite = eval_suite
+        self._hooks: Dict[str, Any] = {}
         self.callbacks: List[Callback] = list(callbacks or [])
         self.init_optimizer = init_optimizer
         self.history: List[Dict[str, Any]] = []
@@ -349,6 +352,11 @@ class Trainer:
         self.skipped_steps = 0
         self.ema: Optional[EMA] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
+        self.lineage: Dict[str, Any] = dict(lineage or {})
+        self.phases: List[Dict[str, Any]] = []        # adopted policy / data changes, oldest first
+        self.base_lrs: List[float] = []
+        self._data_identity: Dict[str, Dict[str, Any]] = {}
+        self._last_mult = 1.0
 
     # ------------------------------------------------------------------ utils
     def _emit(self, event: str, payload: Dict[str, Any]) -> None:
@@ -379,16 +387,29 @@ class Trainer:
             self._log_file.flush()
 
     # ----------------------------------------------------------- checkpointing
-    def _extra_state(self) -> Dict[str, Any]:
-        return {"format_train": 2, "tokens_seen": self.tokens_seen, "best_source": self.best_source,
+    @staticmethod
+    def _optimizer_signature(opt: torch.optim.Optimizer) -> List[Dict[str, Any]]:
+        return [{"n_params": len(g["params"]), "numel": int(sum(p.numel() for p in g["params"])),
+                 "muon": bool(g.get("use_muon", False))} for g in opt.param_groups]
+
+    def _extra_state(self, step: int) -> Dict[str, Any]:
+        return {"format_train": 3, "tokens_seen": self.tokens_seen, "best_source": self.best_source,
                 "plan": self.plan.to_dict(), "train_config": self.tc.persistent_dict(),
-                "skipped_steps": self.skipped_steps}
+                "skipped_steps": self.skipped_steps,
+                "completed_updates": int(step), "applied_updates": int(step) - self.skipped_steps,
+                "lr_state": {"base_lrs": list(self.base_lrs), "last_multiplier": self._last_mult,
+                             "schedule": self.plan.schedule, "horizon_steps": self.plan.max_steps},
+                "optimizer_signature": self._optimizer_signature(self.optimizer),
+                "data": {"identity": self._data_identity, "weights": [float(w) for w in self.ds.weights]},
+                "environment": environment_info(), "hooks": self._hooks,
+                "eval_suite": self.eval_suite.identity() if self.eval_suite is not None else None,
+                "lineage": {**self.lineage, "phases": list(self.phases)}}
 
     def save_latest(self, step: int) -> str:
         path = os.path.join(self.out_dir, "ckpt_latest.pt")
         save_checkpoint(path, self.raw_model, self.optimizer, self.cfg, step, self.best_val_loss,
                         rng_state=capture_rng_state(self.raw_model, self.ds), scaler=self.scaler,
-                        ema_state=self.ema.state_dict() if self.ema else None, extra=self._extra_state())
+                        ema_state=self.ema.state_dict() if self.ema else None, extra=self._extra_state(step))
         self._emit("checkpoint", {"path": path, "step": step, "kind": "latest"})
         return path
 
@@ -402,20 +423,89 @@ class Trainer:
         self._emit("checkpoint", {"path": path, "step": step, "kind": "best"})
         return path
 
-    def _resume(self, path: str) -> int:
+    # ------------------------------------------------------------------- resume
+    def _policy_diffs(self, ckpt: Dict[str, Any]) -> List[str]:
+        """How the training POLICY now differs from the checkpoint's (trajectory fields + the plan)."""
+        out: List[str] = []
+        saved = ckpt.get("train_config")
+        if saved is not None:
+            cur = self.tc.persistent_dict()
+            out += [f"train_config.{k}: checkpoint={saved[k]!r} vs now={cur[k]!r}"
+                    for k in TrainConfig.TRAJECTORY if k in saved and saved[k] != cur[k]]
+        if ckpt.get("plan") is not None:
+            out += plan_change_problems(ckpt["plan"], self.plan.to_dict(), int(ckpt["step"]))
+        if "eval_suite" in ckpt:
+            now = self.eval_suite.identity() if self.eval_suite is not None else None
+            if ckpt["eval_suite"] != now:
+                out.append("eval_suite: the evaluation set differs from the one the checkpoint's best_val_loss was "
+                           "measured on (domains, windows or dataset fingerprints changed)")
+        if ckpt.get("hooks") is not None:
+            for name in ("extra_loss", "batch_loss"):
+                if ckpt["hooks"].get(name) != self._hooks.get(name):
+                    out.append(f"{name}: checkpoint={ckpt['hooks'].get(name)} vs now={self._hooks.get(name)}")
+        return out
+
+    def _data_diffs(self, ckpt: Dict[str, Any]) -> List[str]:
+        """How the training DATA now differs from what the checkpoint was trained on."""
+        saved = ckpt.get("data")
+        if not saved:
+            return []                       # written before data identity was recorded: nothing to compare
+        out = M.identity_mismatches(saved["identity"], self._data_identity)
+        w_old, w_now = saved.get("weights"), [float(w) for w in self.ds.weights]
+        if w_old is not None and len(w_old) == len(w_now) and not np.allclose(w_old, w_now):
+            out.append(f"mixture weights: checkpoint={[round(w, 4) for w in w_old]} vs now={[round(w, 4) for w in w_now]}")
+        return out
+
+    def _resume(self, path: str, on_policy_change: str = "error", on_data_change: str = "error") -> int:
+        """Restore EXACTLY what the checkpoint holds, after verifying that this session is the same run.
+
+        Everything is validated before any state is touched, so a refused resume leaves the model and
+        optimizer as they were. ``on_policy_change="adopt"`` / ``on_data_change="adopt"`` turn a mismatch
+        into a recorded new *phase* of the run (see ``lineage['phases']``) instead of an error: the new
+        hyper-parameters / data apply from the resume step on."""
+        for name, val in (("on_policy_change", on_policy_change), ("on_data_change", on_data_change)):
+            if val not in ("error", "adopt"):
+                raise ValueError(f"{name} must be 'error' or 'adopt', got {val!r}")
         ckpt = load_checkpoint(path, self.device)
         bad = _cfg_mismatch(ckpt["config"], self.cfg.to_dict())
         if bad:
             raise ValueError(f"cannot resume from {path}: model config differs from the checkpoint's:\n  "
                              + "\n  ".join(bad))
-        self.raw_model.load_state_dict(ckpt["model_state_dict"])
         if ckpt.get("optimizer_state_dict") is None:
             raise ValueError(f"{path} is a weights-only checkpoint; it has no optimizer state to resume from. "
                              f"Resume from ckpt_latest.pt, or start a new run initialised from these weights.")
+        step = int(ckpt["step"]) + (1 if ckpt.get("format_version", 1) == 1 else 0)  # v1 stored the step just completed
+        policy, data = self._policy_diffs(ckpt), self._data_diffs(ckpt)
+        if policy and on_policy_change != "adopt":
+            raise ValueError(
+                f"cannot resume {path} exactly: the training policy differs from the checkpoint's:\n  "
+                + "\n  ".join(policy)
+                + "\nAn exact resume continues the same run. To change the policy from here on, pass "
+                  "fit(on_policy_change='adopt') (recorded as a new phase), or start a NEW run from these weights.")
+        if data and on_data_change != "adopt":
+            raise ValueError(
+                f"cannot resume {path} exactly: the training data differs from what the checkpoint was trained on:\n  "
+                + "\n  ".join(data)
+                + "\nPass fit(on_data_change='adopt') to continue on the new data as a recorded new phase, "
+                  "or restore the original dataset.")
+        saved_sig = ckpt.get("optimizer_signature")
+        if saved_sig is not None and saved_sig != self._optimizer_signature(self.optimizer):
+            raise ValueError(f"optimizer state in {path} does not match tc.optimizer={self.tc.optimizer!r} or this model: "
+                             f"parameter groups {saved_sig} (checkpoint) vs {self._optimizer_signature(self.optimizer)} (now)")
+        env_then, env_now = ckpt.get("environment") or {}, environment_info()
+        drift = [f"{k} {env_then[k]} -> {env_now[k]}" for k in ("torch", "numpy") if k in env_then and env_then[k] != env_now[k]]
+        if drift:
+            warnings.warn(f"resuming under a different software stack ({', '.join(drift)}); results are not guaranteed "
+                          f"to be bit-identical to an uninterrupted run across versions.", stacklevel=3)
+
+        fresh_groups = [{k: v for k, v in g.items() if k != "params"} for g in self.optimizer.param_groups]
+        self.raw_model.load_state_dict(ckpt["model_state_dict"])
         try:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         except (ValueError, KeyError, RuntimeError) as e:
             raise ValueError(f"optimizer state in {path} does not match tc.optimizer={self.tc.optimizer!r}: {e}") from e
+        for g, fresh in zip(self.optimizer.param_groups, fresh_groups):
+            g.update(fresh)                 # torch restores the checkpoint's hyper-parameters; this session's config rules
         if ckpt.get("scaler_state_dict"):
             self.scaler.load_state_dict(ckpt["scaler_state_dict"])
         if self.ema is not None and ckpt.get("ema_state_dict"):
@@ -425,14 +515,20 @@ class Trainer:
         self.best_source = ckpt.get("best_source", "raw")
         self.tokens_seen = int(ckpt.get("tokens_seen", 0))
         self.skipped_steps = int(ckpt.get("skipped_steps", 0))
-        # v1 stored the step just completed; v2 stores the number of completed steps.
-        return int(ckpt["step"]) + (1 if ckpt.get("format_version", 1) == 1 else 0)
+        old_lineage = dict(ckpt.get("lineage") or {})
+        self.phases = list(old_lineage.pop("phases", []))
+        self.lineage = {**self.lineage, **old_lineage}
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for kind, diffs in (("policy", policy), ("data", data)):
+            if diffs:
+                self.phases.append({"at_step": step, "kind": kind, "changes": diffs, "time": stamp})
+        return step
 
     # ----------------------------------------------------------------- sampling
     def sample_text(self, use_ema: bool = False) -> str:
         tc = self.tc
         tok = ByteTokenizer()
-        ids = [ByteTokenizer.BOS] + tok.encode(tc.sample_prompt)
+        ids = [ByteTokenizer.DOC_START] + tok.encode(tc.sample_prompt)
         idx = torch.tensor([ids], dtype=torch.long, device=self.device)
         amp = amp_settings(self.dtype, self.device)
         ctx = self.ema.swapped(self.raw_model) if (use_ema and self.ema) else contextlib.nullcontext()
@@ -445,7 +541,15 @@ class Trainer:
         return tok.decode(out[0].tolist())
 
     # --------------------------------------------------------------------- fit
-    def fit(self, resume: bool = True) -> Dict[str, Any]:
+    def fit(self, resume: bool = True, on_policy_change: str = "error", on_data_change: str = "error") -> Dict[str, Any]:
+        """Run (or continue) training.
+
+        ``resume=True`` continues ``out_dir/ckpt_latest.pt`` *exactly* if there is one: same model config,
+        training policy (``TrainConfig.TRAJECTORY`` fields and the plan), data fingerprints and mixture
+        weights, or it raises and says what differs. ``on_policy_change="adopt"`` /
+        ``on_data_change="adopt"`` explicitly accept such differences as a new phase of the run (recorded
+        in the checkpoint's ``lineage``); starting a different experiment from the weights is a fork:
+        build a new model from them, a new ``out_dir``, and a fresh Trainer."""
         tc, plan = self.tc, self.plan
         # ---- distributed / device setup
         self.is_ddp = int(os.environ.get("RANK", -1)) != -1
@@ -478,10 +582,18 @@ class Trainer:
             with open(os.path.join(self.out_dir, "run_plan.json"), "w") as fh:
                 json.dump({"plan": plan.to_dict(), "train_config": tc.persistent_dict(),
                            "model_config": self.cfg.to_dict()}, fh, indent=2)
-        self.ds = ByteDataset(self.data_dirs, self.data_weights, seed=tc.seed, rank=self.rank)
+        # the data behind a run must not change under it: a replaced/rewritten token file is an error
+        self.ds = ByteDataset(self.data_dirs, self.data_weights, seed=tc.seed, rank=self.rank, on_change="error")
+        self.ds.verify()                      # token files agree with their manifests (raises DatasetError)
+        self._data_identity = self.ds.identity()
+        for hook in (self.extra_loss, self.batch_loss):
+            if hasattr(hook, "to"):
+                hook.to(self.device)           # EWC state / distillation teacher follow the model's device
+        self._hooks = {"extra_loss": hook_info(self.extra_loss), "batch_loss": hook_info(self.batch_loss)}
         self.scaler = torch.amp.GradScaler("cuda", enabled=amp["use_scaler"])
         self.optimizer = self._build_optimizer()
         base_lrs = [g["lr"] for g in self.optimizer.param_groups]  # BEFORE any state is loaded (see module doc)
+        self.base_lrs = list(base_lrs)
         floor = tc.min_lr / tc.learning_rate if tc.learning_rate else 0.0
         if tc.ema_decay > 0:
             self.ema = EMA(self.raw_model, tc.ema_decay)
@@ -489,7 +601,7 @@ class Trainer:
         start_step = 0
         latest = os.path.join(self.out_dir, "ckpt_latest.pt")
         if resume and os.path.exists(latest):
-            start_step = self._resume(latest)
+            start_step = self._resume(latest, on_policy_change, on_data_change)
             if self.ema is not None and self.ema.num_updates == 0:
                 self.ema = EMA(self.raw_model, tc.ema_decay)  # checkpoint had no EMA: start averaging now
             self._print(f"[resume] {latest} -> continuing at step {start_step} "
@@ -512,7 +624,9 @@ class Trainer:
             compiled = DDP(compiled, device_ids=ids, find_unused_parameters=self.cfg.layerdrop_max > 0)
         run_model = compiled  # what forward/backward go through; self.model stays the plain module
 
-        eval_batches = self.ds.fixed_batches("val", tc.eval_batches, tc.eval_batch_size, T, self.device)
+        self._T = T
+        eval_batches = (None if self.eval_suite is not None
+                        else self.ds.fixed_batches("val", tc.eval_batches, tc.eval_batch_size, T, self.device))
         self._log_file = open(os.path.join(self.out_dir, "train_log.jsonl"), "a") if self.master else None
         info = gpu_info()
         tokens_per_step = tc.batch_size * tc.grad_accum_steps * T * self.world
@@ -538,6 +652,7 @@ class Trainer:
         try:
             while step < plan.max_steps:
                 mult = plan.multiplier(step, floor)
+                self._last_mult = mult
                 for g, b in zip(self.optimizer.param_groups, base_lrs):
                     g["lr"] = b * mult
 
@@ -549,12 +664,16 @@ class Trainer:
                     with sync:
                         with torch.autocast(device_type=amp["autocast_device"], dtype=amp["amp_dtype"],
                                             enabled=amp["use_amp"]):
-                            _, losses, _ = run_model(x, y)
+                            logits, losses, _ = run_model(x, y)
                             loss = losses["total_loss"]
                             if self.extra_loss is not None:
                                 extra = self.extra_loss(self.raw_model)
                                 losses = dict(losses, extra_loss=extra)
                                 loss = loss + extra
+                            if self.batch_loss is not None:
+                                bl = self.batch_loss(self.raw_model, x, y, logits)
+                                losses = dict(losses, batch_loss=bl)
+                                loss = loss + bl
                         scaled = loss / tc.grad_accum_steps
                         (self.scaler.scale(scaled) if self.scaler.is_enabled() else scaled).backward()
                     for k, v in losses.items():
@@ -644,30 +763,49 @@ class Trainer:
 
         result = {"status": status, "step": step, "best_val_loss": self.best_val_loss,
                   "best_source": self.best_source, "tokens_seen": self.tokens_seen,
-                  "elapsed": time.time() - t_start, "last_val": last_val, "skipped_steps": self.skipped_steps}
+                  "elapsed": time.time() - t_start, "last_val": last_val, "skipped_steps": self.skipped_steps,
+                  "completed_updates": step, "applied_updates": step - self.skipped_steps,
+                  "fingerprints": {k: v["fingerprint"] for k, v in self._data_identity.items()}}
         self._emit("end", result)
         if status == "completed":
             self._print(f"[train] done: step {step}, best val loss {self.best_val_loss:.4f} "
                         f"({self.best_val_loss / math.log(2):.3f} bpb, from {self.best_source} weights)")
         return result
 
+    def _measure(self, eval_batches) -> Dict[str, Any]:
+        """Validation metrics of the CURRENT weights: the eval suite (named domains, macro-averaged) if one was
+        given, else the fixed windows of ``data_dirs[0]``."""
+        if self.eval_suite is not None:
+            r = self.eval_suite.evaluate(self.raw_model, self.device, self.dtype, block_size=self._T)
+            loss = r.selection_loss
+            return {"loss": loss, "bpb": loss / math.log(2.0), "ppl": math.exp(min(loss, 50.0)),
+                    "bpb_bytes": r.macro_bpb_bytes,
+                    "domains": {k: {"loss": m["loss"], "bpb_bytes": m["bpb_bytes"]} for k, m in r.domains.items()}}
+        return evaluate_batches(self.raw_model, eval_batches, self.device, self.dtype)
+
     def _eval_and_maybe_save_best(self, eval_batches, done_step: int) -> Dict[str, Any]:
-        raw = evaluate_batches(self.raw_model, eval_batches, self.device, self.dtype)
+        raw = self._measure(eval_batches)
         rec: Dict[str, Any] = {"step": done_step, "val_loss": raw["loss"], "val_bpb": raw["bpb"],
-                               "val_ppl": raw["ppl"], "tokens": self.tokens_seen}
+                               "val_ppl": raw["ppl"], "val_bpb_bytes": raw["bpb_bytes"], "tokens": self.tokens_seen}
+        if "domains" in raw:
+            rec["val_domains"] = raw["domains"]
         best_loss, source = raw["loss"], "raw"
         if self.ema is not None:
             with self.ema.swapped(self.raw_model):
-                e = evaluate_batches(self.raw_model, eval_batches, self.device, self.dtype)
-            rec.update(val_loss_ema=e["loss"], val_bpb_ema=e["bpb"])
+                e = self._measure(eval_batches)
+            rec.update(val_loss_ema=e["loss"], val_bpb_ema=e["bpb"], val_bpb_bytes_ema=e["bpb_bytes"])
+            if "domains" in e:
+                rec["val_domains_ema"] = e["domains"]
             if e["loss"] < best_loss:
                 best_loss, source = e["loss"], "ema"
         rec["source"] = source
         self._write_log(rec)
         self._emit("eval", rec)
-        msg = f"step {done_step:6d} | val {raw['loss']:.4f} ({raw['bpb']:.3f} bpb)"
+        msg = f"step {done_step:6d} | val {raw['loss']:.4f} ({raw['bpb_bytes']:.3f} bits/byte)"
         if self.ema is not None:
-            msg += f" | ema {rec['val_loss_ema']:.4f} ({rec['val_bpb_ema']:.3f} bpb)"
+            msg += f" | ema {rec['val_loss_ema']:.4f} ({rec['val_bpb_bytes_ema']:.3f} bits/byte)"
+        if "domains" in raw:
+            msg += " | " + ", ".join(f"{k} {m['bpb_bytes']:.3f}" for k, m in raw["domains"].items())
         self._print(msg)
         if best_loss < self.best_val_loss:
             self.best_val_loss, self.best_source = best_loss, source

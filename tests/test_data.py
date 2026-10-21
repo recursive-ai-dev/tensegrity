@@ -83,25 +83,32 @@ def test_legacy_behaviour_without_doc_sep_is_one_eos_per_file(tmp_path):
 
 
 def test_prepare_jsonl_and_parquet_one_eos_per_record(tmp_path):
+    """Strict readers: a record is a document only if it has a usable text field. Anything else is
+    rejected, counted in the manifest, and (past ``max_reject_fraction``) an error -- never glued
+    together from whatever columns happen to exist."""
     pa = pytest.importorskip("pyarrow")
     import pyarrow.parquet as pq
     j = tmp_path / "x.jsonl"
     j.write_text("\n".join([json.dumps({"text": "alpha"}), "not json", json.dumps({"content": "beta"}),
                             json.dumps("gamma"), json.dumps({"other": 1, "name": "delta"}), ""]))
+    with pytest.raises(ValueError, match="rejected"):            # 2 of 5 records are unusable: refuse by default
+        prepare_data(str(j), str(tmp_path / "strict"), val_fraction=0.1, verbose=False)
+    assert not (tmp_path / "strict").exists() and not (tmp_path / "strict.staging").exists()
     out = tmp_path / "oj"
-    prepare_data(str(j), str(out), val_fraction=0.1, verbose=False)
-    # records: {"text"}, an unparseable line (skipped), {"content"}, a bare JSON string, and a
-    # dict with no text key (its scalar values are joined with newlines)
-    want = (list(b"alpha") + [EOS] + list(b"beta") + [EOS] + list(b"gamma") + [EOS]
-            + list(b"1\ndelta") + [EOS])
+    meta = prepare_data(str(j), str(out), val_fraction=0.1, verbose=False, max_reject_fraction=0.5)
+    want = list(b"alpha") + [EOS] + list(b"beta") + [EOS] + list(b"gamma") + [EOS]
     assert _all(str(out)).tolist() == want
+    assert meta["counts"]["n_rejected"] == 2
+    assert meta["counts"]["rejected_reasons"] == {"invalid_json": 1, "no_text_field": 1}
     table = pa.table({"id": [1, 2, 3], "story": ["one", None, "three"], "junk": ["x", "y", "z"]})
     pq.write_table(table, tmp_path / "t.parquet")
     out2 = tmp_path / "op"
-    prepare_data(str(tmp_path / "t.parquet"), str(out2), val_fraction=0.1, text_column="story", verbose=False)
+    meta2 = prepare_data(str(tmp_path / "t.parquet"), str(out2), val_fraction=0.1, text_column="story", verbose=False,
+                         max_reject_fraction=0.5)
     assert _all(str(out2)).tolist() == list(b"one") + [EOS] + list(b"three") + [EOS]
+    assert meta2["counts"]["rejected_reasons"] == {"null_text": 1}
     out3 = tmp_path / "op2"                            # 'auto' prefers a known text column name
-    prepare_data(str(tmp_path / "t.parquet"), str(out3), val_fraction=0.1, verbose=False)
+    prepare_data(str(tmp_path / "t.parquet"), str(out3), val_fraction=0.1, verbose=False, max_reject_fraction=0.5)
     assert _all(str(out3)).tolist() == list(b"one") + [EOS] + list(b"three") + [EOS]
     with pytest.raises(ValueError, match="not found"):
         prepare_data(str(tmp_path / "t.parquet"), str(tmp_path / "bad"), text_column="nope", verbose=False)

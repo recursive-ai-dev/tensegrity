@@ -23,12 +23,15 @@ RMSNorm statistics are kept exact by zero residual channels + the sqrt(old/new) 
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
-from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
+from .checkpoint import unwrap_model
 from .config import TensegrityConfig
 from .data import ByteDataset
 from .model import TensegrityLM
@@ -58,6 +61,117 @@ def _check_compatible(old: TensegrityConfig, new: TensegrityConfig) -> None:
             errs.append(f"{f}: {getattr(old, f)} -> {getattr(new, f)} (growth cannot shrink)")
     if errs:
         raise ValueError("incompatible growth target:\n  " + "\n  ".join(errs))
+
+
+class GrowthError(ValueError):
+    """Growth produced a model that does not faithfully contain its parent (state lost or altered)."""
+
+
+def _rescale_factors(oc: TensegrityConfig, nc: TensegrityConfig) -> Tuple[float, float]:
+    """``(norm_scale, gain_scale)`` -- the exact factors growth applies to carried state.
+
+    Widening multiplies RMSNorm weights by sqrt(D0/D1) (the zero-padded channels dilute the mean square);
+    with ``embed_scale`` the embedding multiplier sqrt(D) also grows by sqrt(D1/D0), so every residual
+    gain must follow by the same factor. Single source of truth for ``grow_model`` AND its report."""
+    D0, D1 = oc.n_embd, nc.n_embd
+    wide = D1 > D0
+    return ((D0 / D1) ** 0.5 if wide else 1.0), ((D1 / D0) ** 0.5 if (wide and oc.embed_scale) else 1.0)
+
+
+def _rescale_map(oc: TensegrityConfig, nc: TensegrityConfig) -> Dict[str, float]:
+    """State-dict key -> ``a`` for carried tensors whose values are multiplied by ``a`` (theta' = a * theta)."""
+    norm_scale, gain_scale = _rescale_factors(oc, nc)
+    out: Dict[str, float] = {}
+    if norm_scale != 1.0:
+        out["ln_f.weight"] = norm_scale
+    for i in range(oc.n_layer):
+        if norm_scale != 1.0:
+            out[f"blocks.{i}.ln1.weight"] = norm_scale
+            out[f"blocks.{i}.ln2.weight"] = norm_scale
+        if gain_scale != 1.0:
+            out[f"blocks.{i}.attn_gain"] = gain_scale
+            out[f"blocks.{i}.ffn_gain"] = gain_scale
+            if oc.n_loops > 1:
+                out[f"blocks.{i}.loop_attn_gains"] = gain_scale
+                out[f"blocks.{i}.loop_ffn_gains"] = gain_scale
+    return out
+
+
+@dataclass
+class GrowthReport:
+    """What a growth step did, in a form that can be stored next to the checkpoint."""
+    axes: List[str]
+    old_params: int
+    new_params: int
+    changed_fields: Dict[str, List[Any]]            # config field -> [old, new]
+    norm_eps: List[float]                            # [old, new]
+    rescale: Dict[str, float]                        # carried tensors that were multiplied by a (theta' = a theta)
+    carried_entries: int                             # old state entries found, with their values, in the new model
+    embedded_entries: int                            # ... of which were placed into a larger tensor
+    carried_scalars: int
+    new_only: List[str]                              # new state entries that have no old counterpart (appended blocks)
+    max_carry_deviation: float                       # max |new[corner] - a * old| over every carried entry
+    checks: Dict[str, Any] = field(default_factory=dict)   # filled by verification steps (preservation, trainability, ...)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    def summary(self) -> str:
+        return (f"growth [{', '.join(self.axes) or 'no change'}]: {self.old_params / 1e6:.2f}M -> {self.new_params / 1e6:.2f}M "
+                f"params; {self.carried_entries} state entries carried ({self.embedded_entries} embedded in larger "
+                f"tensors, {len(self.rescale)} rescaled), {len(self.new_only)} new, "
+                f"max carry deviation {self.max_carry_deviation:.1e}")
+
+
+def verify_growth_mapping(old_model: nn.Module, new_model: nn.Module, rescale: Optional[Mapping[str, float]] = None
+                          ) -> Dict[str, Any]:
+    """Independent audit of a growth step, not trusting the code that did it: every entry of the old
+    model's ``state_dict`` must be present in the new one with its values in the leading corner,
+    multiplied by the declared factor (``rescale``; 1 for everything else). Raises :class:`GrowthError`
+    naming every violation -- an entry the transplant forgot (the v1 grower dropped the Q/K-norm
+    scales), altered, or whose tensor shrank. Returns counts for the :class:`GrowthReport`."""
+    old_sd, new_sd = unwrap_model(old_model).state_dict(), unwrap_model(new_model).state_dict()
+    rescale = dict(rescale or {})
+    new_m = unwrap_model(new_model)
+    problems: List[str] = []
+    carried = embedded = scalars = 0
+    worst = 0.0
+    for key, old in old_sd.items():
+        if key == "lm_head.weight":                      # tied to token_emb.weight, audited through it
+            continue
+        if key not in new_sd:
+            problems.append(f"{key}: present in the old model, absent from the grown one (state would be lost)")
+            continue
+        new = new_sd[key]
+        if new.dim() != old.dim() or any(n < o for n, o in zip(new.shape, old.shape)):
+            problems.append(f"{key}: shape {tuple(old.shape)} -> {tuple(new.shape)} (a carried tensor may only grow)")
+            continue
+        corner = new[tuple(slice(0, s) for s in old.shape)]
+        a = rescale.get(key, 1.0)
+        want = old if a == 1.0 else old * a
+        dev = float((corner.float() - want.float()).abs().max()) if old.numel() else 0.0
+        worst = max(worst, dev)
+        if (a == 1.0 and not torch.equal(corner, want)) or (a != 1.0 and not torch.allclose(corner, want, rtol=1e-6, atol=0)):
+            problems.append(f"{key}: carried values differ from the old model's"
+                            f"{'' if a == 1.0 else f' x {a:.6g}'} (max |diff| {dev:.3e})")
+            continue
+        carried += 1
+        scalars += old.numel()
+        embedded += int(tuple(new.shape) != tuple(old.shape))
+    if getattr(new_m, "lm_head", None) is not None and new_m.lm_head.weight is not new_m.token_emb.weight:
+        problems.append("lm_head.weight is no longer tied to token_emb.weight")
+    old_layers = 1 + max((int(k.split(".")[1]) for k in old_sd if k.startswith("blocks.")), default=-1)
+    new_only = sorted(k for k in new_sd if k not in old_sd)
+    # growing n_loops from 1 creates per-pass gains inside the EXISTING blocks; nothing else may appear there
+    loop_keys = (".loop_attn_gains", ".loop_ffn_gains", ".loop_x0_gains")
+    stray = [k for k in new_only if not (k.startswith("blocks.") and
+                                         (int(k.split(".")[1]) >= old_layers or k.endswith(loop_keys)))]
+    if stray:
+        problems.append(f"new state outside the appended blocks: {stray[:6]} (a locked field changed the architecture?)")
+    if problems:
+        raise GrowthError("growth did not carry the old model faithfully:\n  " + "\n  ".join(problems[:12])
+                          + (f"\n  ... and {len(problems) - 12} more" if len(problems) > 12 else ""))
+    return {"carried": carried, "embedded": embedded, "scalars": scalars, "new_only": new_only, "max_deviation": worst}
 
 
 def retarget(old: TensegrityConfig, size_from: TensegrityConfig, keep_context: bool = True) -> TensegrityConfig:
@@ -129,15 +243,14 @@ def _grow_block(ob: nn.Module, nb: nn.Module, oc: TensegrityConfig, nc: Tensegri
     q0, kv0 = oc.n_head * hd, oc.n_kv_head * hd
     h0 = oc.ffn_hidden
     std = nc.init_std
-    scale = (D0 / D1) ** 0.5
+    scale, gain_scale = _rescale_factors(oc, nc)
     wide = D1 > D0
 
     # ---- norms: sqrt(old/new) keeps x/rms(x) * w exact when the new channels are zero
     for name in ("ln1", "ln2"):
         w_new, w_old = getattr(nb, name).weight, getattr(ob, name).weight
-        w_new[:D0].copy_(w_old * (scale if wide else 1.0))
+        w_new[:D0].copy_(w_old * scale)
     # ---- residual gains (embed_scale makes the stream sqrt(D1/D0) larger -> branches must follow)
-    gain_scale = (D1 / D0) ** 0.5 if (wide and oc.embed_scale) else 1.0
     nb.attn_gain.copy_(ob.attn_gain * gain_scale)
     nb.ffn_gain.copy_(ob.ffn_gain * gain_scale)
     if ob.x0_gain is not None:
@@ -208,11 +321,17 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
                new_n_embd: Optional[int] = None, new_n_head: Optional[int] = None,
                new_n_kv_head: Optional[int] = None, new_block_size: Optional[int] = None,
                new_n_loops: Optional[int] = None,
-               device: Optional[Union[str, torch.device]] = None, seed: Optional[int] = 0
-               ) -> Tuple[TensegrityLM, TensegrityConfig]:
+               device: Optional[Union[str, torch.device]] = None, seed: Optional[int] = 0,
+               return_report: bool = False):
     """
     Return ``(new_model, new_cfg)``: a larger model that, at the moment of growth, computes the
     same function as ``old_model`` (within float rounding) and whose new capacity is trainable.
+    With ``return_report=True`` returns ``(new_model, new_cfg, GrowthReport)``.
+
+    Every entry of the old model's state is audited against the result by
+    :func:`verify_growth_mapping` before this returns -- state the transplant failed to carry (or
+    carried at the wrong scale) raises :class:`GrowthError` instead of producing a model that merely
+    looks right on its first test input. ``old_model`` is never modified (not even moved between devices).
 
     Pass either ``target`` (a full target :class:`TensegrityConfig`, e.g. the next preset), or
     the v1-style keywords (``new_n_layer``, ``new_n_embd``, ``ffn_growth_mult``, ...).
@@ -224,6 +343,7 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
       * width   -- more heads and residual channels, per the reader/writer rule in the module doc;
       * context -- ``block_size`` may grow (RoPE is relative; weights are unchanged).
     """
+    old_model = unwrap_model(old_model)
     old_cfg = old_cfg or old_model.cfg
     if target is None:
         target = derive_target(old_cfg, new_n_layer, ffn_growth_mult, new_n_embd, new_n_head,
@@ -245,15 +365,14 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
     if seed is not None:
         torch.manual_seed(seed)  # reproducible random init of the new (reader) regions
     new_model = TensegrityLM(new_cfg).to(device)
-    old_model = old_model.to(device)
     D0, D1 = old_cfg.n_embd, new_cfg.n_embd
-    scale = (D0 / D1) ** 0.5
+    scale, _ = _rescale_factors(old_cfg, new_cfg)
 
     # ---- embedding (tied lm_head), final norm, confidence head, byte-mix
     emb = new_model.token_emb.weight
     emb.zero_()                                              # new channels = zero writers
     emb[:, :D0].copy_(old_model.token_emb.weight)
-    new_model.ln_f.weight[:D0].copy_(old_model.ln_f.weight * (scale if D1 > D0 else 1.0))
+    new_model.ln_f.weight[:D0].copy_(old_model.ln_f.weight * scale)
     if old_model.confidence_head is not None:
         ch_n, ch_o = new_model.confidence_head, old_model.confidence_head
         ch_n.weight.zero_()                                  # single-factor zero: x_new becomes non-zero via writers
@@ -289,7 +408,24 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
             blk.loop_ffn_gains.zero_()
             if blk.loop_x0_gains is not None:
                 blk.loop_x0_gains.zero_()
-    return new_model, new_cfg
+
+    rescale = _rescale_map(old_cfg, new_cfg)
+    stats = verify_growth_mapping(old_model, new_model, rescale)       # raises GrowthError if anything was lost
+    if not return_report:
+        return new_model, new_cfg
+    od, nd = old_cfg.to_dict(), new_cfg.to_dict()
+    axes = [name for name, grew in (
+        ("depth", new_cfg.n_layer > old_cfg.n_layer), ("loops", new_cfg.n_loops > old_cfg.n_loops),
+        ("ffn", new_cfg.ffn_hidden > old_cfg.ffn_hidden),
+        ("width", new_cfg.n_embd > old_cfg.n_embd or new_cfg.n_head > old_cfg.n_head),
+        ("context", new_cfg.block_size > old_cfg.block_size)) if grew]
+    report = GrowthReport(
+        axes=axes, old_params=old_model.num_parameters(), new_params=new_model.num_parameters(),
+        changed_fields={k: [od[k], nd[k]] for k in nd if od.get(k) != nd[k]},
+        norm_eps=[old_cfg.norm_eps, new_cfg.norm_eps], rescale=rescale, carried_entries=stats["carried"],
+        embedded_entries=stats["embedded"], carried_scalars=stats["scalars"], new_only=stats["new_only"],
+        max_carry_deviation=stats["max_deviation"])
+    return new_model, new_cfg, report
 
 
 @torch.no_grad()
@@ -324,6 +460,19 @@ def grow_optimizer_state(old_model: nn.Module, old_opt_or_state: Any,
     else:
         return 0
 
+    from .optim import SingleDeviceMuonWithAuxAdam
+    group_of = {id(p): g for g in new_opt.param_groups for p in g["params"]}
+
+    def as_step(value: Any, p: torch.Tensor) -> Any:
+        # the vendored Muon/AdamW keeps an int; torch's AdamW needs a float32 singleton tensor, on the
+        # parameter's device when it is fused/capturable and on the CPU otherwise
+        n = int(value.item()) if isinstance(value, torch.Tensor) else int(value)
+        if isinstance(new_opt, SingleDeviceMuonWithAuxAdam):
+            return n
+        g = group_of.get(id(p), {})
+        on_dev = g.get("fused") or g.get("capturable")
+        return torch.tensor(float(n), dtype=torch.float32, device=p.device if on_dev else "cpu")
+
     count = 0
     for name, np_ in new_model.named_parameters():
         ost = old_by_name.get(name)
@@ -346,8 +495,7 @@ def grow_optimizer_state(old_model: nn.Module, old_opt_or_state: Any,
             eas[sl].copy_(eas_old[sl].to(np_.device, np_.dtype))
             nst["exp_avg"] = ea
             nst["exp_avg_sq"] = eas
-            step_val = ost.get("step", 0)
-            nst["step"] = int(step_val.item()) if isinstance(step_val, torch.Tensor) else int(step_val)
+            nst["step"] = as_step(ost.get("step", 0), np_)
             count += 1
     return count
 
@@ -361,9 +509,11 @@ def check_function_preserved(old_model: TensegrityLM, new_model: TensegrityLM, c
                              device: Optional[str] = None, n_tokens: int = 48, batch: int = 2,
                              atol: float = 1e-4, verbose: bool = True) -> float:
     """Feed identical random byte sequences through both models (eval, fp32, TF32 off) and
-    require the logits (and confidence scores) to agree within ``atol``. Raises on failure."""
+    require the logits (and confidence scores) to agree within ``atol``. Raises on failure.
+    Each model is fed on its own device (they may differ, e.g. a CPU parent and a GPU candidate); the
+    comparison is made on the CPU. ``device`` is accepted for backward compatibility."""
     cfg = cfg or old_model.cfg
-    device = device or str(next(old_model.parameters()).device)
+    od, nd = next(old_model.parameters()).device, next(new_model.parameters()).device
     was = (old_model.training, new_model.training)
     old_model.eval()
     new_model.eval()
@@ -372,12 +522,12 @@ def check_function_preserved(old_model: TensegrityLM, new_model: TensegrityLM, c
     torch.backends.cudnn.allow_tf32 = False
     try:
         g = torch.Generator().manual_seed(0)
-        x = torch.randint(0, 256, (batch, min(n_tokens, cfg.block_size)), generator=g).to(device)
-        lo, _, co = old_model(x)
-        ln, _, cn = new_model(x)
-        diff = float((lo - ln).abs().max())
+        x = torch.randint(0, 256, (batch, min(n_tokens, cfg.block_size)), generator=g)
+        lo, _, co = old_model(x.to(od))
+        ln, _, cn = new_model(x.to(nd))
+        diff = float((lo.cpu() - ln.cpu()).abs().max())
         if co is not None and cn is not None:
-            diff = max(diff, float((co - cn).abs().max()))
+            diff = max(diff, float((co.cpu() - cn.cpu()).abs().max()))
         ok = diff < atol
         if verbose:
             print(f"[grow] max |old - new| over logits/confidence = {diff:.3e} ({'PASS' if ok else 'FAIL'}, atol={atol:.0e})")
@@ -499,15 +649,35 @@ def check_growth_trainable(new_model: TensegrityLM, old_cfg: TensegrityConfig, x
 # Elastic Weight Consolidation (continual learning)
 # =============================================================================
 
+FISHER_KINDS = ("empirical", "sampled")
+
+
 def compute_fisher_diagonal(model: TensegrityLM, data_dir: str, device: Optional[str] = None,
                             n_sequences: int = 64, seq_len: Optional[int] = None, dtype: str = "auto",
-                            seed: int = 0) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+                            seed: int = 0, kind: str = "empirical"
+                            ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """
-    Diagonal *empirical* Fisher: the mean over sequences of the squared per-sequence gradient of
-    the cross-entropy. (v1 squared the gradient of an 8-sequence batch mean, which underestimates
-    the Fisher by roughly the batch size; here every sequence gets its own backward pass.)
-    Gradients are computed in fp32 for stability. Returns ``(fisher, params_snapshot)``.
+    Diagonal Fisher estimate, ``mean over sequences of (gradient of that sequence's loss)^2``, one
+    backward pass per sequence (v1 squared an 8-sequence batch mean, which underestimates it by
+    roughly the batch size). Returns ``(fisher, params_snapshot)``.
+
+    Observation unit: **one sequence of ``seq_len`` bytes, loss = mean cross-entropy over its
+    positions** (so values scale with 1/seq_len^2 relative to a per-sequence log-likelihood *sum*; the
+    EWC strength ``lambda`` absorbs that constant). ``kind`` says which gradients are squared:
+
+    * ``"empirical"`` (default): the gradient of the loss on the TRUE next bytes. Cheap and standard in
+      EWC, but it is **not** the Fisher information -- it is the second moment of the loss gradient under
+      the data distribution, which differs from the Fisher whenever the model is not already the
+      data-generating distribution (Kunstner et al., 2019, arXiv:1905.12558).
+    * ``"sampled"``: the Monte-Carlo true Fisher -- the next bytes are SAMPLED from the model's own
+      predictive distribution and the gradient of their log-likelihood is squared. Same cost; this is the
+      quantity the Laplace approximation behind EWC actually calls for.
+
+    Gradients are computed in fp32 for stability, in eval mode (no dropout / LayerDrop).
     """
+    if kind not in FISHER_KINDS:
+        raise ValueError(f"kind must be one of {FISHER_KINDS}, got {kind!r}")
+    model = unwrap_model(model)
     cfg = model.cfg
     device = device or str(next(model.parameters()).device)
     seq_len = seq_len or cfg.block_size
@@ -515,13 +685,21 @@ def compute_fisher_diagonal(model: TensegrityLM, data_dir: str, device: Optional
     batches = ds.fixed_batches("train", n_sequences, 1, seq_len, device, seed=seed)
     was_training = model.training
     model.eval()
+    gen = torch.Generator().manual_seed(seed + 1)
     fisher = {n: torch.zeros_like(p, dtype=torch.float32) for n, p in model.named_parameters() if p.requires_grad}
     snapshot = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
     for x, y in batches:
         model.zero_grad(set_to_none=True)
         with torch.enable_grad():
-            _, losses, _ = model(x, y)
-            losses["ce_loss"].backward()
+            if kind == "empirical":
+                _, losses, _ = model(x, y)
+                loss = losses["ce_loss"]
+            else:
+                logits, _, _ = model(x)
+                flat = logits.float().reshape(-1, logits.size(-1))
+                y_s = torch.multinomial(torch.softmax(flat.detach(), -1).cpu(), 1, generator=gen).to(flat.device)
+                loss = torch.nn.functional.cross_entropy(flat, y_s.view(-1))
+            loss.backward()
         for n, p in model.named_parameters():
             if p.grad is not None:
                 fisher[n] += p.grad.detach().float().pow(2)
@@ -534,31 +712,50 @@ def compute_fisher_diagonal(model: TensegrityLM, data_dir: str, device: Optional
 
 @torch.no_grad()
 def expand_reference_state(old_fisher: Dict[str, torch.Tensor], old_params: Dict[str, torch.Tensor],
-                           new_model: nn.Module) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """Re-map an (old_fisher, old_params) pair onto a grown model: carried-over entries keep
-    their Fisher and anchor; new entries get Fisher 0 and anchor = their current value, so EWC
-    puts no constraint on the new capacity."""
+                           new_model: nn.Module, rescale: Optional[Union[Mapping[str, float], GrowthReport]] = None
+                           ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Re-map an (old_fisher, old_params) pair onto a grown model so the EWC penalty starts at 0 and
+    keeps its meaning.
+
+    * New entries (new heads / units / channels) get Fisher 0 and anchor = their current value: EWC puts
+      no constraint on the new capacity.
+    * Carried entries that growth RESCALED (``theta' = a * theta``: RMSNorm weights and residual gains
+      under width growth) must move their anchor and importance with them: ``theta0' = a * theta0`` and
+      ``F' = F / a^2`` -- the same quadratic penalty ``F (theta - theta0)^2`` in the new coordinates.
+      Pass the ``rescale`` mapping (or the :class:`GrowthReport`) that ``grow_model(return_report=True)``
+      returned. Without it every factor is taken as 1, which is only right for depth / FFN / context growth:
+      after width growth the penalty of the *unchanged function* would be non-zero and EWC would pull the
+      rescaled weights back, undoing the function preservation.
+
+    The mapping is exact for these per-tensor rescalings; the importance of weights whose *role* changed
+    (e.g. attention projections now sharing a wider residual stream) is carried over as an approximation --
+    re-estimate the Fisher on the grown model (``compute_fisher_diagonal``) when that matters.
+    """
     if not old_fisher or not old_params:
         return {}, {}
+    factors: Mapping[str, float] = getattr(rescale, "rescale", rescale) or {}
     new_f, new_p = {}, {}
     for name, p in new_model.named_parameters():
         if name not in old_fisher:
             continue
-        of, op = old_fisher[name], old_params[name]
+        a = float(factors.get(name, 1.0))
+        of, op = old_fisher[name].to(p.device) / (a * a), old_params[name].to(p.device, p.dtype) * a
         if of.shape == p.shape:
-            new_f[name], new_p[name] = of.to(p.device), op.to(p.device, p.dtype)
+            new_f[name], new_p[name] = of, op
         else:
             nf = torch.zeros_like(p, dtype=torch.float32)
             nop = p.detach().clone()
             sl = tuple(slice(0, min(s, p.shape[i])) for i, s in enumerate(of.shape))
-            nf[sl] = of[sl].to(p.device)
-            nop[sl] = op[sl].to(p.device, p.dtype)
+            nf[sl] = of[sl]
+            nop[sl] = op[sl]
             new_f[name], new_p[name] = nf, nop
     return new_f, new_p
 
 
 def ewc_penalty(model: nn.Module, fisher: Dict[str, torch.Tensor], old_params: Dict[str, torch.Tensor]) -> torch.Tensor:
-    """``sum_i F_i (theta_i - theta*_i)^2`` over parameters present in ``fisher``."""
+    """``sum_i F_i (theta_i - theta*_i)^2`` over parameters present in ``fisher`` (a quadratic
+    approximation of the old task's loss around ``theta*``; see :func:`compute_fisher_diagonal` for what
+    ``F`` is and is not)."""
     total = None
     for name, p in model.named_parameters():
         f = fisher.get(name)

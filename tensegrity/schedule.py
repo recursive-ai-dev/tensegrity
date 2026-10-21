@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
@@ -85,6 +85,40 @@ def plan_for_time_budget(tokens_per_sec: float, hours: float, tokens_per_step: i
     if max_tokens is not None:
         budget = min(budget, int(max_tokens))
     return make_plan(max(budget, tokens_per_step * 10), tokens_per_step, **kw)
+
+
+def plan_change_problems(old: Dict[str, Any], new: Dict[str, Any], completed_steps: int) -> List[str]:
+    """Why ``new`` is not an exact continuation of ``old`` at ``completed_steps`` (empty list = legal).
+
+    A WSD learning rate depends only on ``warmup / stable / decay`` steps -- ``max_steps`` is just the
+    loop bound -- so two changes leave every step already taken exactly where it was:
+      * a different ``max_steps`` with the same warmup/stable/decay (stopping a run early, or running it on);
+      * what :func:`extend_plan` does: more steps, all added to the stable phase, before the cool-down began.
+    A cosine schedule's shape depends on its total length, so for it any change is illegal."""
+    if old == new:
+        return []
+    out = [f"plan.{k}: checkpoint={old[k]!r} vs now={new[k]!r}"
+           for k in ("tokens_per_step", "warmup_steps", "schedule") if old[k] != new[k]]
+    if old["schedule"] != "wsd" or new["schedule"] != "wsd":
+        for k in ("max_steps", "stable_steps", "decay_steps"):
+            if old[k] != new[k]:
+                out.append(f"plan.{k}: checkpoint={old[k]!r} vs now={new[k]!r} (a cosine schedule's shape depends "
+                           f"on its total length; only a WSD plan can be changed mid-run)")
+        return out
+    if old["decay_steps"] != new["decay_steps"]:
+        out.append(f"plan.decay_steps: checkpoint={old['decay_steps']} vs now={new['decay_steps']}")
+    d_stable, d_max = new["stable_steps"] - old["stable_steps"], new["max_steps"] - old["max_steps"]
+    if d_stable == 0:
+        return out                                            # same LR curve; only the loop bound moved
+    if d_stable != d_max or d_stable < 0:
+        out.append(f"plan.stable_steps/max_steps: checkpoint={old['stable_steps']}/{old['max_steps']} vs now="
+                   f"{new['stable_steps']}/{new['max_steps']} (the only legal change to the LR curve is extend_plan(): "
+                   f"more steps, all of them added to the stable phase)")
+    elif completed_steps > old["warmup_steps"] + old["stable_steps"]:
+        out.append(f"plan was extended, but the cool-down already began at step "
+                   f"{old['warmup_steps'] + old['stable_steps']} (this run completed {completed_steps}); "
+                   f"continue as a NEW run initialised from the weights instead")
+    return out
 
 
 def extend_plan(plan: RunPlan, extra_steps: int, at_step: int = 0) -> RunPlan:

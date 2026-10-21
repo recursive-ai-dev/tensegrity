@@ -1,286 +1,29 @@
-"""Data pipeline: streaming ``prepare``, deterministic/resumable batching, dataset downloads.
+"""Data access: deterministic/resumable batching over prepared datasets, dataset downloads, audits.
 
-On-disk format (unchanged from v1): ``train.bin`` / ``val.bin`` are flat ``uint16`` token
-streams (bytes 0-255, EOS = 257 between documents) plus ``meta.json``. Existing prepared
-directories keep working.
+Ingestion (``prepare_data`` and friends) lives in :mod:`tensegrity.ingest` and is re-exported here, so
+``tensegrity.data.prepare_data`` keeps working. On-disk format (unchanged from v1): ``train.bin`` /
+``val.bin`` are flat ``uint16`` token streams (bytes 0-255, EOS = 257 after every document) plus a
+``meta.json`` (a verifiable manifest since manifest version 1, see :mod:`tensegrity.manifest`).
 """
 
 from __future__ import annotations
 
-import glob
 import json
 import os
-import random
-import re
 import socket
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+import warnings
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
+from . import manifest as M
+from .ingest import (SUPPORTED_EXTS, _StreamEncoder, _partial_suffix_len, list_source_files,  # noqa: F401
+                     prepare_data)
 from .tokenizer import ByteTokenizer
-
-SUPPORTED_EXTS = {".txt", ".md", ".parquet", ".jsonl"}
-_TEXT_KEYS = ("text", "content", "body", "story")
-_EOS = ByteTokenizer.EOS
-
-
-# =============================================================================
-# Streaming encoder: raw bytes -> uint16 tokens, optional document separator -> EOS
-# =============================================================================
-
-def _partial_suffix_len(tail: bytes, sep: bytes) -> int:
-    """Length of the longest proper prefix of ``sep`` that ``tail`` ends with."""
-    for k in range(min(len(sep) - 1, len(tail)), 0, -1):
-        if tail.endswith(sep[:k]):
-            return k
-    return 0
-
-
-class _StreamEncoder:
-    """Feeds byte chunks in, emits uint16 token arrays. A literal ``sep`` (e.g. TinyStories'
-    ``<|endoftext|>``) becomes ONE real EOS token instead of 13 ordinary bytes the model
-    would have to learn to spell. A separator split across chunk boundaries is handled."""
-
-    def __init__(self, sink, sep: Optional[bytes] = None):
-        self.sink = sink
-        self.sep = sep or None
-        self._rx = re.compile(re.escape(self.sep)) if self.sep else None
-        self.carry = b""
-        self.n_tokens = 0
-        self.n_docs = 0
-
-    def _emit(self, arr: np.ndarray) -> None:
-        if arr.size:
-            self.n_tokens += int(arr.size)
-            self.sink(arr)
-
-    def _encode(self, data: bytes) -> None:
-        if not data:
-            return
-        arr = np.frombuffer(data, dtype=np.uint8).astype(np.uint16)
-        if self._rx is None:
-            self._emit(arr)
-            return
-        pos = np.fromiter((m.start() for m in self._rx.finditer(data)), dtype=np.int64)
-        if pos.size:
-            arr[pos] = _EOS
-            if len(self.sep) > 1:
-                keep = np.ones(arr.size, dtype=bool)
-                for off in range(1, len(self.sep)):
-                    keep[pos + off] = False
-                arr = arr[keep]
-            self.n_docs += int(pos.size)
-        self._emit(arr)
-
-    def feed(self, raw: bytes) -> None:
-        data = self.carry + raw
-        self.carry = b""
-        if self._rx is not None:
-            last_end = 0
-            for m in self._rx.finditer(data):
-                last_end = m.end()
-            hold = _partial_suffix_len(data[last_end:], self.sep)
-            if hold:
-                self.carry, data = data[-hold:], data[:-hold]
-        self._encode(data)
-
-    def end_document(self) -> None:
-        """Flush any held partial separator as ordinary bytes, then emit one EOS."""
-        if self.carry:
-            tail, self.carry = self.carry, b""
-            self._encode(tail)
-        self._emit(np.array([_EOS], dtype=np.uint16))
-        self.n_docs += 1
-
-
-# =============================================================================
-# File readers
-# =============================================================================
-
-def _iter_jsonl_docs(path: str) -> Iterator[bytes]:
-    bad = total = 0
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            total += 1
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                bad += 1
-                continue
-            val = None
-            if isinstance(obj, dict):
-                for k in _TEXT_KEYS:
-                    if obj.get(k):
-                        val = obj[k]
-                        break
-                if val is None:
-                    val = "\n".join(str(v) for v in obj.values() if isinstance(v, (str, int, float)))
-            elif isinstance(obj, str):
-                val = obj
-            if val:
-                yield str(val).encode("utf-8", errors="replace")
-    if total and bad / total > 0.01:
-        print(f"[prepare] warning: {bad}/{total} unparseable lines in {path}")
-
-
-def _pick_text_column(names: Sequence[str], string_cols: Sequence[str], requested: str, path: str) -> str:
-    if requested != "auto":
-        if requested not in names:
-            raise ValueError(f"{path}: column {requested!r} not found; available: {list(names)}")
-        return requested
-    for k in _TEXT_KEYS:
-        if k in string_cols:
-            return k
-    if string_cols:
-        return string_cols[0]
-    raise ValueError(f"{path}: no string column to use as text; columns: {list(names)}")
-
-
-def _iter_parquet_docs(path: str, text_column: str) -> Iterator[bytes]:
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ImportError as e:  # pragma: no cover - environment dependent
-        raise ImportError("reading .parquet needs `pip install pyarrow`") from e
-    pf = pq.ParquetFile(path)
-    schema = pf.schema_arrow
-    string_cols = [f.name for f in schema if pa.types.is_string(f.type) or pa.types.is_large_string(f.type)]
-    col = _pick_text_column(schema.names, string_cols, text_column, path)
-    for batch in pf.iter_batches(columns=[col], batch_size=4096):
-        for s in batch.column(0).to_pylist():
-            if s:
-                yield str(s).encode("utf-8", errors="replace")
-
-
-def _iter_text_chunks(path: str, chunk_bytes: int) -> Iterator[bytes]:
-    with open(path, "rb") as fh:
-        while True:
-            chunk = fh.read(chunk_bytes)
-            if not chunk:
-                return
-            yield chunk
-
-
-def list_source_files(data_path: str) -> List[str]:
-    if os.path.isdir(data_path):
-        allf = sorted(f for f in glob.glob(os.path.join(data_path, "**", "*"), recursive=True) if os.path.isfile(f))
-        files = [f for f in allf if os.path.splitext(f)[1].lower() in SUPPORTED_EXTS]
-        return files or allf  # fall back to everything if nothing has a known extension
-    return [data_path]
-
-
-# =============================================================================
-# prepare
-# =============================================================================
-
-def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: int = 1337,
-                 shuffle_files: bool = False, doc_sep: Optional[str] = None,
-                 text_column: str = "auto", max_bytes: Optional[int] = None,
-                 chunk_bytes: int = 64 << 20, verbose: bool = True) -> Dict[str, Any]:
-    """
-    Stream text / markdown / parquet / jsonl file(s) into ``out_dir/{train,val}.bin``.
-
-    * Memory use is O(chunk_bytes), not O(corpus): a multi-GB file is processed in chunks.
-    * Plain-text files: one EOS after each file, plus one at every occurrence of ``doc_sep``
-      (a literal string such as ``"<|endoftext|>"``). Parquet / jsonl: one EOS per row/record.
-    * ``max_bytes``: stop after this many *source* bytes (cheap way to take a slice).
-    * The last ``val_fraction`` of the token stream becomes the validation set.
-
-    Returns the metadata dict that is also written to ``meta.json``.
-    """
-    if not 0.0 < val_fraction < 1.0:
-        raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
-    files = list_source_files(data_path)
-    if not files:
-        raise ValueError(f"No files found at {data_path}")
-    if shuffle_files:
-        files = list(files)
-        random.Random(seed).shuffle(files)
-    os.makedirs(out_dir, exist_ok=True)
-
-    sep = doc_sep.encode("utf-8") if doc_sep else None
-    tmp_path = os.path.join(out_dir, "stream.tmp")
-    n_src = 0
-    t0 = time.time()
-    with open(tmp_path, "wb") as sink_f:
-        enc = _StreamEncoder(lambda a: a.tofile(sink_f), sep)
-        budget = max_bytes
-        for f in files:
-            if budget is not None and n_src >= budget:
-                break
-            ext = os.path.splitext(f)[1].lower()
-            if ext == ".parquet" or ext == ".jsonl":
-                docs = _iter_parquet_docs(f, text_column) if ext == ".parquet" else _iter_jsonl_docs(f)
-                for doc in docs:
-                    if budget is not None and n_src >= budget:
-                        break
-                    enc.feed(doc)
-                    enc.end_document()
-                    n_src += len(doc)
-            else:
-                for chunk in _iter_text_chunks(f, chunk_bytes):
-                    if budget is not None and n_src + len(chunk) > budget:
-                        chunk = chunk[: budget - n_src]
-                    enc.feed(chunk)
-                    n_src += len(chunk)
-                    if verbose:
-                        print(f"\r[prepare] {n_src / 1e6:8.1f} MB read, {enc.n_tokens / 1e6:8.1f}M tokens", end="")
-                    if budget is not None and n_src >= budget:
-                        break
-                enc.end_document()
-        n = enc.n_tokens
-        n_docs = enc.n_docs
-    if verbose:
-        print()
-    if n == 0:
-        os.remove(tmp_path)
-        raise ValueError(f"All files at {data_path} are empty; nothing to tokenize.")
-
-    n_val = max(1, int(n * val_fraction))
-    n_train = n - n_val
-    if n_train <= 0:
-        os.remove(tmp_path)
-        raise ValueError("Dataset too small after train/val split; provide more data.")
-
-    # split in place: copy the tail to val.bin, truncate the stream to become train.bin
-    val_path = os.path.join(out_dir, "val.bin")
-    train_path = os.path.join(out_dir, "train.bin")
-    stream = np.memmap(tmp_path, dtype=np.uint16, mode="r", shape=(n,))
-    with open(val_path, "wb") as vf:
-        for s in range(n_train, n, 1 << 24):
-            np.asarray(stream[s: min(n, s + (1 << 24))]).tofile(vf)
-    del stream
-    os.truncate(tmp_path, n_train * 2)
-    os.replace(tmp_path, train_path)
-
-    meta = {
-        "vocab_size": ByteTokenizer.VOCAB_SIZE,
-        "dtype": "uint16",
-        "n_train_tokens": int(n_train),
-        "n_val_tokens": int(n_val),
-        "n_documents": int(n_docs),
-        "source_bytes": int(n_src),
-        "source_files": files,
-        "val_fraction": val_fraction,
-        "shuffle_files": shuffle_files,
-        "seed": seed if shuffle_files else None,
-        "doc_sep": doc_sep,
-        "max_bytes": max_bytes,
-        "prepare_seconds": round(time.time() - t0, 1),
-    }
-    with open(os.path.join(out_dir, "meta.json"), "w") as fh:
-        json.dump(meta, fh, indent=2)
-    if verbose:
-        print(f"[prepare] {len(files)} file(s) -> {n_train:,} train / {n_val:,} val tokens "
-              f"({n_docs:,} documents) in {meta['prepare_seconds']}s -> {out_dir}")
-    return meta
 
 
 def load_meta(data_dir: str) -> Dict[str, Any]:
@@ -302,35 +45,80 @@ class ByteDataset:
       probability ``weights[i]`` (replay / continual-learning mixes).
     * ``fixed_batches`` gives a deterministic evaluation set, so validation numbers are
       comparable from step to step (the v1 loop drew fresh random batches every eval).
+    * Memory maps are tied to the file they opened (inode, size, mtime). If a token file is replaced
+      or rewritten while the dataset object lives, the next access notices: ``on_change="remap"``
+      (default) warns and maps the new file, ``on_change="error"`` raises -- the Trainer uses the
+      latter, because the data behind a run must not change under it.
     """
 
-    def __init__(self, data_dirs, weights: Optional[Sequence[float]] = None, seed: int = 1337, rank: int = 0):
+    def __init__(self, data_dirs, weights: Optional[Sequence[float]] = None, seed: int = 1337, rank: int = 0,
+                 on_change: str = "remap"):
         if isinstance(data_dirs, str):
             data_dirs = [data_dirs]
         self.data_dirs = list(data_dirs)
         if not self.data_dirs:
             raise ValueError("data_dirs is empty")
+        if on_change not in ("remap", "error"):
+            raise ValueError(f"on_change must be 'remap' or 'error', got {on_change!r}")
         w = np.asarray(weights if weights is not None else [1.0] * len(self.data_dirs), dtype=np.float64)
         if len(w) != len(self.data_dirs) or (w < 0).any() or w.sum() <= 0:
             raise ValueError("weights must be non-negative, sum > 0, one per data dir")
         self.weights = w / w.sum()
         self.rng = np.random.default_rng([seed, rank])
+        self.on_change = on_change
+        self.n_remaps = 0
         self._arrs: Dict[Tuple[str, str], np.memmap] = {}
+        self._sigs: Dict[Tuple[str, str], Tuple[int, int, int]] = {}
+
+    # ------------------------------------------------------------------ storage
+    @staticmethod
+    def _signature(path: str) -> Tuple[int, int, int]:
+        st = os.stat(path)
+        return st.st_ino, st.st_size, st.st_mtime_ns
 
     def array(self, data_dir: str, split: str) -> np.memmap:
         key = (data_dir, split)
+        path = os.path.join(data_dir, f"{split}.bin")
+        try:
+            sig = self._signature(path)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"{path} not found; run prepare_data first") from None
         arr = self._arrs.get(key)
-        if arr is None:
-            path = os.path.join(data_dir, f"{split}.bin")
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{path} not found; run prepare_data first")
-            arr = np.memmap(path, dtype=np.uint16, mode="r")
-            self._arrs[key] = arr
+        if arr is not None and self._sigs[key] == sig:
+            return arr
+        if arr is not None:
+            msg = (f"{path} changed on disk while it was open (was inode/size/mtime {self._sigs[key]}, "
+                   f"now {sig})")
+            if self.on_change == "error":
+                raise RuntimeError(msg + ". Prepared datasets must not change during a run; prepare the new data "
+                                         "into a new directory instead.")
+            warnings.warn(msg + "; mapping the new file.", stacklevel=2)
+            self.n_remaps += 1
+            self._arrs.pop(key, None)
+        arr = np.memmap(path, dtype=np.uint16, mode="r")
+        self._arrs[key], self._sigs[key] = arr, sig
         return arr
+
+    def close(self) -> None:
+        """Drop every memory map (they are re-opened lazily on the next access)."""
+        self._arrs.clear()
+        self._sigs.clear()
 
     def n_tokens(self, split: str, dir_index: int = 0) -> int:
         return len(self.array(self.data_dirs[dir_index], split))
 
+    def identity(self) -> Dict[str, Dict[str, Any]]:
+        """``{"0": {"dir", "fingerprint", "kind", ...}, ...}`` -- what a checkpoint records about the data."""
+        return {str(i): {"dir": d, **M.data_identity(d)} for i, d in enumerate(self.data_dirs)}
+
+    def verify(self, deep: bool = False) -> None:
+        """Raise :class:`~tensegrity.manifest.DatasetError` if any directory disagrees with its manifest."""
+        for d in self.data_dirs:
+            problems = M.verify_dataset(d, deep=deep)
+            if problems:
+                raise M.DatasetError(f"dataset {d} is inconsistent: " + "; ".join(problems))
+
+    # ----------------------------------------------------------------- sampling
     def _check(self, arr: np.ndarray, path: str, split: str, block_size: int) -> None:
         if len(arr) <= block_size + 1:
             raise ValueError(f"{path}/{split}.bin has only {len(arr)} tokens, need > block_size+1 "
@@ -361,6 +149,8 @@ class ByteDataset:
                 continue
             arr = self.array(d, split)
             self._check(arr, d, split, block_size)
+            # a window starting at s needs tokens s .. s+block_size, so s <= len - block_size - 1;
+            # `integers` excludes its upper bound, so len - block_size is exactly right.
             starts = self.rng.integers(0, len(arr) - block_size, size=rows.size)
             x[rows], y[rows] = self._gather(arr, starts, block_size)
         return self._to_device(x, y, device)
@@ -387,10 +177,62 @@ class ByteDataset:
 
 
 # =============================================================================
-# Downloads (resumable, retrying, with a clean cut at a document boundary)
+# Audit
 # =============================================================================
 
-_UA = {"User-Agent": "tensegrity-lm/2.0 (+https://github.com/recursive-ai-dev/tensegrity)"}
+def _decode_head(path: str, n_examples: int, example_bytes: int, read_tokens: int = 1 << 20) -> List[str]:
+    toks = np.fromfile(path, dtype=np.uint16, count=read_tokens)
+    out, start = [], 0
+    for e in np.flatnonzero(toks == ByteTokenizer.EOS).tolist():
+        doc = toks[start:e]
+        start = e + 1
+        if doc.size:
+            out.append(bytes(doc[doc < 256].astype(np.uint8)[:example_bytes]).decode("utf-8", errors="replace"))
+        if len(out) >= n_examples:
+            break
+    if not out and toks.size:
+        out.append(bytes(toks[toks < 256].astype(np.uint8)[:example_bytes]).decode("utf-8", errors="replace"))
+    return out
+
+
+def audit_dataset(data_dir: str, n_examples: int = 2, example_bytes: int = 200, deep: bool = False) -> Dict[str, Any]:
+    """Everything worth looking at before spending compute on a dataset: the manifest summary,
+    consistency problems (``deep=True`` re-hashes the files), decoded example documents from both
+    splits, and byte statistics (a corpus of mostly control bytes is not text). Returns a dict whose
+    ``"text"`` entry is ready to print."""
+    problems = M.verify_dataset(data_dir, deep=deep)
+    meta = M.read_meta(data_dir) if os.path.exists(os.path.join(data_dir, "meta.json")) else {}
+    ident = M.data_identity(data_dir)
+    stats: Dict[str, Any] = {}
+    for split in ("train", "val"):
+        arr = np.fromfile(os.path.join(data_dir, f"{split}.bin"), dtype=np.uint16, count=1 << 22)
+        b = arr[arr < 256]
+        stats[split] = {
+            "sampled_tokens": int(arr.size), "eos_rate": float(np.mean(arr == ByteTokenizer.EOS)) if arr.size else 0.0,
+            "printable_fraction": float(np.mean(((b >= 32) & (b < 127)) | (b == 10) | (b == 9) | (b >= 128))) if b.size else 0.0,
+            "control_fraction": float(np.mean((b < 32) & (b != 10) & (b != 9) & (b != 13))) if b.size else 0.0}
+    examples = {s: _decode_head(os.path.join(data_dir, f"{s}.bin"), n_examples, example_bytes) for s in ("train", "val")}
+    lines = [f"dataset {data_dir}", M.render_manifest_summary(meta) if meta else f"identity    : {ident['fingerprint']}"]
+    if ident["kind"] == "quick":
+        lines.append("note        : no manifest (prepared by an older release); identity is a quick size+edges hash")
+    lines.append("integrity   : " + ("OK" + (" (content re-hashed)" if deep else " (sizes match the manifest)")
+                                      if not problems else "PROBLEMS: " + "; ".join(problems)))
+    for s in ("train", "val"):
+        st = stats[s]
+        lines.append(f"{s:5s} bytes  : {100 * st['printable_fraction']:.1f}% text-like, {100 * st['control_fraction']:.2f}% "
+                     f"control, 1 EOS per {1 / st['eos_rate']:.0f} tokens" if st["eos_rate"] else
+                     f"{s:5s} bytes  : {100 * st['printable_fraction']:.1f}% text-like, no EOS markers in the sample")
+        for ex in examples[s]:
+            lines.append(f"  {s} example: {ex!r}")
+    return {"fingerprint": ident["fingerprint"], "kind": ident["kind"], "problems": problems, "stats": stats,
+            "examples": examples, "meta": meta, "text": "\n".join(lines)}
+
+
+# =============================================================================
+# Downloads (resumable, retrying, hash-recorded, with a clean cut at a document boundary)
+# =============================================================================
+
+_UA = {"User-Agent": "tensegrity-lm/2.1 (+https://github.com/recursive-ai-dev/tensegrity)"}
 
 
 def _truncate_at_boundary(path: str, boundary: bytes, window: int = 8 << 20) -> None:
@@ -406,9 +248,22 @@ def _truncate_at_boundary(path: str, boundary: bytes, window: int = 8 << 20) -> 
             fh.truncate(start + k + len(boundary))
 
 
+def _sidecar(dest: str) -> str:
+    return dest + ".meta.json"
+
+
+def read_download_record(dest: str) -> Optional[Dict[str, Any]]:
+    """The provenance record written next to a downloaded file (url, size, sha256), or None."""
+    try:
+        with open(_sidecar(dest)) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
 def download_file(url: str, dest: str, max_bytes: Optional[int] = None, retries: int = 5,
                   timeout: float = 30.0, chunk: int = 1 << 20, boundary: Optional[bytes] = None,
-                  verbose: bool = True) -> str:
+                  verbose: bool = True, expected_sha256: Optional[str] = None) -> str:
     """
     Download ``url`` to ``dest`` (streaming, never holds the file in memory).
 
@@ -417,11 +272,22 @@ def download_file(url: str, dest: str, max_bytes: Optional[int] = None, retries:
     * ``max_bytes``: stop after that many bytes (only that range is requested); with
       ``boundary`` the slice is then trimmed back to the last complete document.
     * Retries network errors with exponential backoff; raises after ``retries`` failures.
+    * The finished file's SHA-256 is recorded in ``dest + '.meta.json'``; ``expected_sha256`` makes a
+      mismatch an error (the partial file is discarded). A cached ``dest`` whose size disagrees with its
+      record is treated as corrupt and fetched again.
     """
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        rec = read_download_record(dest)
+        ok = rec is None or rec.get("bytes") == os.path.getsize(dest)
+        if ok and expected_sha256 is not None:
+            ok = (rec or {}).get("sha256", M.sha256_file(dest)) == expected_sha256
+        if ok:
+            if verbose:
+                print(f"[download] using cached {dest} ({os.path.getsize(dest) / 1e6:.1f} MB)")
+            return dest
         if verbose:
-            print(f"[download] using cached {dest} ({os.path.getsize(dest) / 1e6:.1f} MB)")
-        return dest
+            print(f"[download] cached {dest} does not match its record; downloading again")
+        os.replace(dest, dest + f".corrupt-{int(time.time())}")
     os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
     part = dest + ".part"
     last_err: Optional[BaseException] = None
@@ -474,9 +340,18 @@ def download_file(url: str, dest: str, max_bytes: Optional[int] = None, retries:
         print()
     if boundary:
         _truncate_at_boundary(part, boundary)
+    digest = M.sha256_file(part)
+    if expected_sha256 is not None and digest != expected_sha256:
+        os.remove(part)
+        raise RuntimeError(f"{url}: SHA-256 {digest} does not match the expected {expected_sha256}; "
+                           f"the partial download was discarded")
+    size = os.path.getsize(part)
     os.replace(part, dest)
+    with open(_sidecar(dest), "w") as fh:
+        json.dump({"url": url, "bytes": size, "sha256": digest, "max_bytes": max_bytes,
+                   "downloaded_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, fh, indent=2)
     if verbose:
-        print(f"[download] saved {dest} ({os.path.getsize(dest) / 1e6:.1f} MB)")
+        print(f"[download] saved {dest} ({size / 1e6:.1f} MB, sha256 {digest[:16]}...)")
     return dest
 
 
@@ -498,7 +373,7 @@ DATASETS: Dict[str, Dict[str, Any]] = {
 
 
 def fetch_dataset(name: str, root: str, max_mb: Optional[float] = None, verbose: bool = True) -> Dict[str, Any]:
-    """Download (cached) a named dataset into ``root`` and return its spec plus ``path``."""
+    """Download (cached) a named dataset into ``root`` and return its spec plus ``path`` and ``sha256``."""
     if name not in DATASETS:
         raise ValueError(f"unknown dataset {name!r}; available: {sorted(DATASETS)}")
     spec = dict(DATASETS[name])
@@ -506,22 +381,31 @@ def fetch_dataset(name: str, root: str, max_mb: Optional[float] = None, verbose:
     suffix = f".{int(max_mb)}mb" if max_bytes else ""
     dest = os.path.join(root, spec["filename"] + suffix)
     boundary = spec["doc_sep"].encode() if (max_bytes and spec["doc_sep"]) else None
-    spec["path"] = download_file(spec["url"], dest, max_bytes=max_bytes, boundary=boundary, verbose=verbose)
+    spec["path"] = download_file(spec["url"], dest, max_bytes=max_bytes, boundary=boundary, verbose=verbose,
+                                 expected_sha256=spec.get("sha256"))
+    spec["sha256"] = (read_download_record(dest) or {}).get("sha256")
     return spec
 
 
 def fetch_hf_streaming(repo: str, config: Optional[str], split: str, text_field: str, out_path: str,
-                       max_mb: float, doc_sep: str = "<|endoftext|>", verbose: bool = True) -> str:
+                       max_mb: float, doc_sep: str = "<|endoftext|>", verbose: bool = True,
+                       revision: Optional[str] = None) -> str:
     """Stream documents from a Hugging Face dataset (needs ``pip install datasets``) into one
-    text file separated by ``doc_sep`` until ``max_mb`` megabytes were written."""
+    text file separated by ``doc_sep`` until ``max_mb`` megabytes were written.
+
+    ``revision`` pins a commit/tag/branch of the dataset repository. Without it the *current* head is
+    read, which is not reproducible; a warning says so and the sidecar record notes ``revision: null``."""
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return out_path
     try:
         from datasets import load_dataset
     except ImportError as e:  # pragma: no cover - environment dependent
         raise ImportError("this dataset needs `pip install datasets`") from e
+    if revision is None:
+        warnings.warn(f"fetch_hf_streaming({repo!r}): no revision pinned; the data may change between runs. "
+                      f"Pass revision='<commit sha>' to make this download reproducible.", stacklevel=2)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    ds = load_dataset(repo, config, split=split, streaming=True)
+    ds = load_dataset(repo, config, split=split, streaming=True, revision=revision)
     budget, written, n_docs, t_last = int(max_mb * 1e6), 0, 0, time.time()
     part = out_path + ".part"
     with open(part, "wb") as fh:
@@ -538,7 +422,12 @@ def fetch_hf_streaming(repo: str, config: Optional[str], split: str, text_field:
                 t_last = time.time()
             if written >= budget:
                 break
+    digest = M.sha256_file(part)
     os.replace(part, out_path)
+    with open(_sidecar(out_path), "w") as fh:
+        json.dump({"source": f"huggingface:{repo}", "config": config, "split": split, "revision": revision,
+                   "text_field": text_field, "bytes": written, "documents": n_docs, "sha256": digest,
+                   "downloaded_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, fh, indent=2)
     if verbose:
-        print(f"\n[stream] saved {out_path} ({written / 1e6:.1f} MB, {n_docs:,} docs)")
+        print(f"\n[stream] saved {out_path} ({written / 1e6:.1f} MB, {n_docs:,} docs, sha256 {digest[:16]}...)")
     return out_path

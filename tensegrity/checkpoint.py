@@ -24,6 +24,43 @@ from .model import TensegrityLM
 
 CHECKPOINT_FORMAT_VERSION = 2
 _REQUIRED = ("model_state_dict", "config", "step", "best_val_loss")
+_WRAPPER_PREFIXES = ("_orig_mod.", "module.")
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """The plain module under any ``torch.compile`` / DistributedDataParallel / DataParallel wrappers.
+
+    A compiled module's ``state_dict()`` keys carry an ``_orig_mod.`` prefix (DDP's carry ``module.``),
+    which a plain model cannot load; serialisation always goes through the unwrapped module."""
+    while True:
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        elif isinstance(model, (nn.parallel.DistributedDataParallel, nn.DataParallel)):
+            model = model.module
+        else:
+            return model
+
+
+def normalize_state_dict(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip wrapper prefixes (``_orig_mod.`` from torch.compile, ``module.`` from DDP) when EVERY key
+    carries them, so a state dict saved from a wrapped model loads into the plain one."""
+    changed = True
+    while changed and state:
+        changed = False
+        for pre in _WRAPPER_PREFIXES:
+            if all(k.startswith(pre) for k in state):
+                state = {k[len(pre):]: v for k, v in state.items()}
+                changed = True
+    return state
+
+
+def environment_info() -> Dict[str, str]:
+    """Versions that bound how exactly a run can be reproduced (PyTorch documents that results are not
+    guaranteed identical across releases or platforms)."""
+    import platform
+    from . import __version__
+    return {"tensegrity": __version__, "torch": torch.__version__, "numpy": np.__version__,
+            "python": platform.python_version(), "platform": platform.platform()}
 
 
 # =============================================================================
@@ -41,7 +78,7 @@ def capture_rng_state(model: Optional[nn.Module] = None, dataset: Any = None) ->
     }
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
-    raw = getattr(model, "module", model)
+    raw = unwrap_model(model) if model is not None else None
     if raw is not None and hasattr(raw, "layerdrop_state"):
         state["layerdrop"] = raw.layerdrop_state()
     if dataset is not None:
@@ -86,7 +123,7 @@ def restore_rng_state(state: Optional[Dict[str, Any]], model: Optional[nn.Module
                     torch.cuda.set_rng_state(cs[dev], device=dev)
         except Exception as e:  # noqa: BLE001
             warnings.warn(f"failed to restore CUDA RNG state ({e})")
-    raw = getattr(model, "module", model)
+    raw = unwrap_model(model) if model is not None else None
     if "layerdrop" in state and raw is not None and hasattr(raw, "set_layerdrop_state"):
         raw.set_layerdrop_state(state["layerdrop"])
     if dataset is not None and "dataset" in state:
@@ -118,7 +155,7 @@ def save_checkpoint(path: str, model: nn.Module, optimizer: Optional[torch.optim
                     extra: Optional[Dict[str, Any]] = None) -> None:
     """``optimizer=None`` writes a weights-only checkpoint (still loadable by
     :func:`load_checkpoint` / :func:`load_model`)."""
-    raw = getattr(model, "module", model)
+    raw = unwrap_model(model)
     ckpt: Dict[str, Any] = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "model_state_dict": raw.state_dict(),
@@ -154,18 +191,20 @@ def load_checkpoint(path: str, device: str = "cpu", allow_legacy_pickle: bool = 
     missing = [k for k in _REQUIRED if k not in ckpt]
     if missing:
         raise ValueError(f"{path} is missing checkpoint key(s) {missing}; not a TensegrityLM checkpoint.")
+    ckpt["model_state_dict"] = normalize_state_dict(ckpt["model_state_dict"])
     ver = ckpt.get("format_version")
     if ver not in (1, CHECKPOINT_FORMAT_VERSION):
         warnings.warn(f"{path} has format_version={ver!r}; this code reads 1 and {CHECKPOINT_FORMAT_VERSION}.")
     return ckpt
 
 
-def load_model(path: str, device: str = "cpu", use_ema: bool = False, verbose: bool = False
-               ) -> Tuple[TensegrityLM, TensegrityConfig, Dict[str, Any]]:
+def load_model(path: str, device: str = "cpu", use_ema: bool = False, verbose: bool = False,
+               strict_config: bool = True) -> Tuple[TensegrityLM, TensegrityConfig, Dict[str, Any]]:
     """Build the model described by a checkpoint and load its weights. ``use_ema=True`` loads
-    the EMA weights when the checkpoint has them."""
+    the EMA weights when the checkpoint has them. A config field this release does not know is an
+    error (``strict_config=False`` drops it with a warning instead)."""
     ckpt = load_checkpoint(path, device)
-    cfg = TensegrityConfig.from_dict(ckpt["config"])
+    cfg = TensegrityConfig.from_dict(ckpt["config"], strict=strict_config)
     model = TensegrityLM(cfg, verbose=verbose)
     state = ckpt["model_state_dict"]
     if use_ema and ckpt.get("ema_state_dict"):

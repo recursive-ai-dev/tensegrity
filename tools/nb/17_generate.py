@@ -7,18 +7,20 @@ TOP_P = 0.95  #@param {type:"slider", min:0.1, max:1.0, step:0.05}
 MIN_P = 0.02  #@param {type:"slider", min:0.0, max:0.3, step:0.01}
 CONFIDENCE_TEMPERATURE = True  #@param {type:"boolean"}
 SEED = 0  #@param {type:"integer"}
+CACHE_MODE = "window"  #@param ["window", "streaming"]
 
 import codecs
 from IPython.display import HTML, display
 tok = tg.ByteTokenizer()
 torch.manual_seed(SEED)
-_ids = [tok.BOS] + tok.encode(PROMPT)
+_ids = [tok.DOC_START] + tok.encode(PROMPT)
 _idx = torch.tensor([_ids], dtype=torch.long, device=DEVICE)
 _dec = codecs.getincrementaldecoder("utf-8")("replace")
 _toks, _conf = list(_ids), [None] * len(_ids)
 print(PROMPT, end="", flush=True)
 for _t, _c in BEST.stream(_idx, MAX_NEW_BYTES, temperature=TEMPERATURE, top_k=TOP_K or None, top_p=TOP_P,
-                          min_p=MIN_P or None, use_confidence_temp=CONFIDENCE_TEMPERATURE and BEST.confidence_head is not None):
+                          min_p=MIN_P or None, use_confidence_temp=CONFIDENCE_TEMPERATURE and BEST.confidence_head is not None,
+                          cache_mode=CACHE_MODE):
     _toks.append(_t); _conf.append(_c)
     if _t < 256:
         print(_dec.decode(bytes([_t])), end="", flush=True)

@@ -1,2 +1,4 @@
-## 3 · Plan the run
+## 3 · Plan the run & preflight
 The notebook measures **your GPU's real throughput** on the chosen model, finds the largest micro-batch that fits in memory, and sizes the training run to your `TRAIN_HOURS` using a warmup-stable-decay schedule (so the learning rate always finishes decaying by the end of the time you gave it). If a plan for this run already exists in Drive it is reused unchanged, which is what makes resuming exact.
+
+Then a **preflight report** answers, before any hours are spent: what the model really is (parameter count, which layers are global, how far its attention can reach), which exact data it will see, whether the budget over-trains that data, whether the optimizer and dtype stay finite *on this device*, whether there is memory headroom, and whether the model survives save → reload. If anything is a blocker the cell stops.

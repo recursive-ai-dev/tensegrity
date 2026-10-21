@@ -22,8 +22,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 sys.path.insert(0, ROOT)
 
 OUT = os.path.join(ROOT, "notebooks", "Tensegrity_Colab.ipynb")
-MODULE_ORDER = ["config", "tokenizer", "layers", "model", "optim", "data", "checkpoint", "hw", "schedule", "train",
-                "growth", "presets", "ladder", "analysis", "export", "viz", "colab", "cli", "__init__", "__main__"]
+MODULE_ORDER = ["config", "tokenizer", "layers", "model", "optim", "manifest", "ingest", "data", "checkpoint", "hw",
+                "schedule", "evaluation", "growth", "continual", "train", "presets", "ladder", "workflow", "analysis",
+                "export", "perf", "viz", "colab", "report", "cli", "__init__", "__main__"]
 
 
 def _cell_id(kind: str, key: str) -> str:
@@ -63,7 +64,9 @@ def build() -> dict:
         name = os.path.basename(path)
         body = open(path, encoding="utf-8").read()
         if name.startswith("03_source_header"):
-            hdr = md(name, body)
+            n_lines = sum(open(os.path.join(ROOT, "tensegrity", f"{m}.py"), encoding="utf-8").read().count("\n")
+                          for m in MODULE_ORDER)
+            hdr = md(name, body.replace("{{SOURCE_LINES}}", f"{round(n_lines, -2):,}"))
             cells.append(hdr)
             collapsed.append(hdr["id"])
             # the package sources, one %%writefile cell per module

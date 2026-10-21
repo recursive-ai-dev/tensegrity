@@ -94,10 +94,15 @@ class RMSNorm(nn.Module):
 
 def precompute_rope(head_dim: int, max_seq_len: int, base: float = 10000.0,
                     device=None, dtype=torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
-    """cos/sin tables of shape (max_seq_len, head_dim // 2)."""
+    """cos/sin tables of shape (max_seq_len, head_dim // 2).
+
+    The angles are computed in float64 and rounded once. Streaming generation runs far past ``block_size``
+    and a float32 ``position * frequency`` product loses precision linearly with position (measured max
+    phase error: ~2e-4 rad at 10^4 positions, ~1e-3..5e-3 at 10^5, ~2e-2..5e-2 at 10^6, for head_dim 32-128),
+    which is noise in the relative rotation between a query and its keys."""
     assert head_dim % 2 == 0
-    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
-    t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float64) / head_dim))
+    t = torch.arange(max_seq_len, device=device, dtype=torch.float64)
     freqs = torch.outer(t, inv_freq)
     return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
@@ -247,12 +252,14 @@ class CausalSelfAttention(nn.Module):
         return apply_rope(q, cos, sin), apply_rope(k, cos, sin), v, v_raw
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                past: Optional[KV] = None, return_kv: bool = False,
+                past: Optional[KV] = None, return_kv: bool = False, max_cache: Optional[int] = None,
                 v0: Optional[torch.Tensor] = None, return_v0: bool = False):
         """
         Training / prefill (``past is None``): full-sequence attention starting at position 0.
         Decode (``past`` given): ``x`` must be ONE new token; its K/V are appended to ``past``.
         With ``return_kv`` the (trimmed) cache for subsequent decode steps is returned too.
+        ``max_cache`` bounds a GLOBAL layer's cache to the most recent ``max_cache`` keys (streaming decode);
+        local layers are always bounded by their window.
         """
         B, T, _ = x.shape
         q, k, v, v_raw = self._project(x, cos, sin, v0)
@@ -262,9 +269,10 @@ class CausalSelfAttention(nn.Module):
             assert T == 1, "cached decode supports a single new token per step"
             k = torch.cat([past[0], k], dim=2)
             v = torch.cat([past[1], v], dim=2)
-            if not self.is_global and k.shape[2] > self.sliding_window:
-                k = k[:, :, -self.sliding_window:]
-                v = v[:, :, -self.sliding_window:]
+            limit = self.sliding_window if not self.is_global else max_cache
+            if limit is not None and k.shape[2] > limit:
+                k = k[:, :, -limit:]
+                v = v[:, :, -limit:]
             ke, ve = _expand_kv(k, v, self.n_rep)
             y = F.scaled_dot_product_attention(q, ke, ve)  # every cached key is causally visible
         elif self.is_global:
@@ -375,7 +383,7 @@ class Block(nn.Module):
         return x, homeo
 
     def forward_incremental(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                            x0: Optional[torch.Tensor], past: Optional[KV],
+                            x0: Optional[torch.Tensor], past: Optional[KV], max_cache: Optional[int] = None,
                             v0: Optional[torch.Tensor] = None, loop_idx: int = 0,
                             return_v0: bool = False):
         """KV-cached forward for inference (eval mode; no LayerDrop, no homeostasis loss)."""
@@ -383,9 +391,10 @@ class Block(nn.Module):
         if xg is not None and x0 is not None:
             x = x + xg * x0
         if return_v0:
-            attn_out, kv, v0_out = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, v0=v0, return_v0=True)
+            attn_out, kv, v0_out = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, max_cache=max_cache,
+                                             v0=v0, return_v0=True)
         else:
-            attn_out, kv = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, v0=v0)
+            attn_out, kv = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, max_cache=max_cache, v0=v0)
             v0_out = v0
         x = x + ag * attn_out
         x = x + fg * self.ffn(self.ln2(x))

@@ -113,12 +113,20 @@ class TensegrityConfig:
         return {f.name for f in dataclasses.fields(cls)}
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any], warn_unknown: bool = True) -> "TensegrityConfig":
+    def from_dict(cls, d: Dict[str, Any], warn_unknown: bool = True, strict: bool = False) -> "TensegrityConfig":
         """Build from a (possibly older/newer) config dict. Missing keys take defaults
-        (== legacy behaviour for fields added later); unknown keys are dropped with a warning
-        instead of being silently ignored."""
+        (== legacy behaviour for fields added later).
+
+        Unknown keys are either a typo or a field written by a NEWER release whose meaning this code
+        does not know -- dropping it could silently build a different network. With ``strict=True``
+        (what every checkpoint / export loader uses) they raise; otherwise they are dropped with a
+        warning."""
         known = cls.field_names()
         unknown = sorted(k for k in d if k not in known)
+        if unknown and strict:
+            raise ValueError(f"unknown TensegrityConfig field(s) {unknown}: not a typo-free config of this release "
+                             f"(known fields: {sorted(known)}). The file was probably written by a newer version of "
+                             f"tensegrity; upgrade it, or load with strict=False to drop them at your own risk.")
         if unknown and warn_unknown:
             warnings.warn(f"TensegrityConfig.from_dict: ignoring unknown key(s) {unknown}", stacklevel=2)
         return cls(**{k: v for k, v in d.items() if k in known})
@@ -149,6 +157,25 @@ class TensegrityConfig:
 
     def is_global_layer(self, layer_idx: int) -> bool:
         return (layer_idx + 1) % self.global_every == 0
+
+    @property
+    def n_global_layers(self) -> int:
+        return sum(self.is_global_layer(i) for i in range(self.n_layer))
+
+    def receptive_field(self) -> int:
+        """The longest dependency the network CAN express, in positions (the current byte included).
+
+        With at least one global layer a byte can read any earlier byte directly, so this is
+        ``block_size``. With none, information can only hop ``sliding_window - 1`` positions per local
+        layer, and ByteMix adds ``byte_mix_kernel - 1`` at the input:
+        ``1 + n_layer * (sliding_window - 1) + (byte_mix_kernel - 1)`` (e.g. 4 local layers of window
+        124 see at most 493 bytes of a 1024-byte context), capped at ``block_size``. This is an upper
+        bound on what the architecture allows, not a measurement of what a trained model uses --
+        see :func:`tensegrity.evaluation.context_probe` for that."""
+        if self.n_global_layers:
+            return self.block_size
+        mix = max(0, self.byte_mix_kernel - 1)
+        return min(self.block_size, 1 + self.n_layer * (self.sliding_window - 1) + mix)
 
     def n_params(self) -> int:
         """Exact parameter count (tied embedding counted once). Verified against a real
@@ -202,6 +229,8 @@ class TensegrityConfig:
         n = self.n_params()
         kinds = "".join("G" if self.is_global_layer(i) else "l" for i in range(self.n_layer))
         loops = f"x{self.n_loops}" if self.n_loops > 1 else ""
+        rf = self.receptive_field()
+        reach = f"reach={rf}" + ("" if rf == self.block_size else f" (LOCAL-ONLY: sees at most {rf} of {self.block_size} bytes)")
         return (f"{n / 1e6:.2f}M params | L={self.n_layer}{loops} d={self.n_embd} "
                 f"heads={self.n_head}/{self.n_kv_head}kv (hd={self.head_dim}) ffn={self.ffn_hidden} "
-                f"ctx={self.block_size} win={self.sliding_window} layers[{kinds}]")
+                f"ctx={self.block_size} win={self.sliding_window} layers[{kinds}] {reach}")
