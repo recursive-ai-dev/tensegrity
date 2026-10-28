@@ -28,3 +28,29 @@ jobs:
         run: python tools/build_notebook.py --check
       - name: Tests (includes headless execution of the Colab notebook)
         run: python -m pytest -q --durations=10
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build Python distributions
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Build Debian package without root or runtime dependencies
+        run: |
+          python tools/build_deb.py
+          dpkg-deb --info dist/tensegrity-lm_*.deb
+          cd dist
+          sha256sum --check tensegrity-lm_*.deb.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tensegrity-distributions
+          path: |
+            dist/*.deb
+            dist/*.sha256
+            dist/*.whl
+            dist/*.tar.gz

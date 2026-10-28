@@ -25,35 +25,102 @@ import math
 import os
 from typing import Optional
 
-import torch
+import json
+import sys
 
 from . import __version__
-from .checkpoint import load_model, save_checkpoint
-from .data import audit_dataset, prepare_data
-from .export import export_safetensors, write_model_card
-from .evaluation import context_probe, format_probe
-from .growth import check_function_preserved, check_growth_trainable, grow_model, retarget
-from .hw import autotune_micro_batch, measure_throughput, pick_device, pick_dtype
-from .manifest import file_record, render_manifest_summary
-from .model import TensegrityLM
-from .perf import benchmark_generation, format_generation_benchmark, format_sdpa_report, sdpa_backend_report
-from .presets import (LADDER_NAMES, describe_presets, get_preset, get_preset_config, train_setup)
-from .report import format_preflight, preflight_report, write_run_report
-from .schedule import make_plan, plan_for_time_budget
-from .tokenizer import ByteTokenizer
-from .train import TrainConfig, Trainer, evaluate, load_run_plan, preflight_or_fallback
-from .workflow import compare_continual_strategies
+LADDER_NAMES = ("1m", "2m", "5m", "10m", "50m", "115m")
 
 
 def _bool(x: str) -> bool:
-    return str(x).lower() in ("1", "true", "yes", "y")
+    value = str(x).lower()
+    if value in ("1", "true", "yes", "y"):
+        return True
+    if value in ("0", "false", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError("expected true/false, yes/no or 1/0")
+
+
+def _json(value) -> str:
+    # JSON has no NaN/Infinity; absent evaluation populations become null.
+    def clean(x):
+        if isinstance(x, float) and not math.isfinite(x):
+            return None
+        if isinstance(x, dict):
+            return {k: clean(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [clean(v) for v in x]
+        return x
+    return json.dumps(clean(value), indent=2, ensure_ascii=False, allow_nan=False)
+
+
+def _positive_int(value):
+    result = int(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return result
+
+
+def _nonnegative_int(value):
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return result
+
+
+def _number(value, minimum=0.0, maximum=None, inclusive=False):
+    result = float(value)
+    if not math.isfinite(result) or (result < minimum if inclusive else result <= minimum):
+        raise argparse.ArgumentTypeError(f"must be finite and {'>=' if inclusive else '>'} {minimum}")
+    if maximum is not None and result > maximum:
+        raise argparse.ArgumentTypeError(f"must be <= {maximum}")
+    return result
+
+
+def _nonnegative_float(value):
+    return _number(value, inclusive=True)
+
+
+def _probability(value):
+    return _number(value, maximum=1.0, inclusive=True)
+
+
+def _positive_probability(value):
+    return _number(value, maximum=1.0)
+
+
+def cmd_doctor(args) -> None:
+    from .diagnostics import format_installation_report, installation_report
+    report = installation_report(smoke=args.smoke)
+    print(_json(report) if args.json else format_installation_report(report))
+    if not report["ok"]:
+        raise SystemExit(1)
+
+
+def cmd_convert_checkpoint(args) -> None:
+    from .checkpoint import load_model, save_checkpoint
+    if not args.trust_legacy_pickle:
+        raise ValueError("conversion requires --trust-legacy-pickle; only use this for an input you trust")
+    if os.path.lexists(args.out):
+        raise FileExistsError(f"destination already exists: {args.out}")
+    model, cfg, ckpt = load_model(args.ckpt, "cpu", allow_legacy_pickle=True)
+    save_checkpoint(args.out, model, None, cfg, ckpt["step"], ckpt["best_val_loss"],
+                    extra={"converted_from": os.path.basename(args.ckpt)})
+    # Validate the output under the normal safe loader before reporting success.
+    load_model(args.out, "cpu")
+    print(f"Converted weights to safe v2 checkpoint: {args.out} (optimizer and RNG state omitted)")
 
 
 def cmd_presets(args) -> None:
+    from .presets import describe_presets
+
     print(describe_presets())
 
 
 def cmd_prepare(args) -> None:
+    from .data import prepare_data
+    from .manifest import render_manifest_summary
+
     meta = prepare_data(args.data_path, args.out_dir, args.val_fraction, args.seed, doc_sep=args.doc_sep,
                         max_bytes=int(args.max_mb * 1e6) if args.max_mb else None, format=args.format,
                         text_field=args.text_field, record_template=args.record_template,
@@ -64,17 +131,30 @@ def cmd_prepare(args) -> None:
 
 
 def cmd_audit(args) -> None:
+    from .data import audit_dataset
+
     rep = audit_dataset(args.data_dir, n_examples=args.examples, deep=args.deep)
-    print(rep["text"])
+    print(_json(rep) if args.json else rep["text"])
     if rep["problems"]:
         raise SystemExit(1)
 
 
 def cmd_train(args) -> None:
+    import torch
+    from .checkpoint import load_model
+    from .hw import autotune_micro_batch, measure_throughput, pick_device, pick_dtype
+    from .manifest import file_record
+    from .model import TensegrityLM
+    from .presets import get_preset, get_preset_config, train_setup
+    from .schedule import make_plan, plan_for_time_budget
+    from .train import TrainConfig, Trainer, load_run_plan, preflight_or_fallback
+
     device = pick_device(args.device)
     dtype = pick_dtype(args.dtype, device)
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Trainer seeds stochastic training, but initialization happens before fit().
+    torch.random.default_generator.manual_seed(args.seed)
     saved = load_run_plan(args.out_dir)
     overrides = {k: getattr(args, k) for k in ("dropout", "block_size", "sliding_window", "layerdrop_max",
                                                "byte_mix_kernel", "byte_mix_bilinear", "x0_mix", "v0_mix",
@@ -133,6 +213,12 @@ def cmd_train(args) -> None:
 
 
 def cmd_generate(args) -> None:
+    import codecs
+    import torch
+    from .checkpoint import load_model
+    from .hw import pick_device
+    from .tokenizer import ByteTokenizer
+
     device = pick_device(args.device)
     model, cfg, _ = load_model(args.ckpt, device, use_ema=args.ema)
     model.eval()
@@ -145,21 +231,44 @@ def cmd_generate(args) -> None:
     if not ids:
         raise SystemExit("nothing to condition on: give a --prompt or use --start_token eos")
     idx = torch.tensor([ids], dtype=torch.long, device=device)
-    out = model.generate(idx, args.max_new_tokens, temperature=args.temperature, top_k=args.top_k,
-                         top_p=args.top_p, min_p=args.min_p, use_confidence_temp=args.use_confidence_temp,
-                         stop_on_eos=not args.no_stop_on_eos, use_cache=not args.no_kv_cache,
-                         cache_mode=args.cache_mode)
-    print(tok.decode(out[0].tolist()))
+    kwargs = dict(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p, min_p=args.min_p,
+                  use_confidence_temp=args.use_confidence_temp, stop_on_eos=not args.no_stop_on_eos,
+                  use_cache=not args.no_kv_cache, cache_mode=args.cache_mode)
+    if args.stream:
+        # Bytes from one Unicode character can arrive across several model tokens.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        print(tok.decode(ids), end="", flush=True)
+        for token, _ in model.stream(idx, args.max_new_tokens, **kwargs):
+            if token < 256:
+                print(decoder.decode(bytes([token])), end="", flush=True)
+        print(decoder.decode(b"", final=True), flush=True)
+    else:
+        out = model.generate(idx, args.max_new_tokens, **kwargs)
+        print(tok.decode(out[0].tolist()))
 
 
 def cmd_eval(args) -> None:
+    from .checkpoint import load_model
+    from .hw import pick_device, pick_dtype
+    from .train import evaluate
+
     device = pick_device(args.device)
     model, cfg, _ = load_model(args.ckpt, device, use_ema=args.ema)
     r = evaluate(model, args.data_dir, cfg, device, pick_dtype(args.dtype, device), args.eval_batches)
-    print(f"val_loss = {r['loss']:.4f}  bits/byte = {r['bpb']:.4f}  perplexity = {r['ppl']:.3f}")
+    if args.json:
+        print(_json(r))
+    else:
+        print(f"val_loss = {r['loss']:.4f}  bits/byte = {r['bpb_bytes']:.4f}  "
+              f"bits/token = {r['bpb']:.4f}  perplexity = {r['ppl']:.3f}")
 
 
 def cmd_grow(args) -> None:
+    from .checkpoint import load_model, save_checkpoint
+    from .growth import check_function_preserved, check_growth_trainable, grow_model, retarget
+    from .hw import pick_device
+    from .manifest import file_record
+    from .presets import get_preset_config
+
     device = pick_device(args.device)
     old, old_cfg, ckpt = load_model(args.ckpt, device, use_ema=args.ema)
     target = retarget(old_cfg, get_preset_config(args.to))   # size from the preset, function-defining fields from the checkpoint
@@ -173,6 +282,12 @@ def cmd_grow(args) -> None:
 
 
 def cmd_preflight(args) -> None:
+    from .hw import autotune_micro_batch, pick_device, pick_dtype
+    from .model import TensegrityLM
+    from .presets import get_preset, get_preset_config, train_setup
+    from .report import format_preflight, preflight_report
+    from .schedule import make_plan
+
     device = pick_device(args.device)
     dtype = pick_dtype(args.dtype, device)
     preset = get_preset(args.preset)
@@ -194,6 +309,8 @@ def cmd_preflight(args) -> None:
 
 
 def cmd_report(args) -> None:
+    from .report import write_run_report
+
     rep = write_run_report(args.run_dir, data_dirs=args.data_dir, export_dir=args.export_dir,
                            evaluate=bool(args.data_dir))
     print(f"wrote {os.path.join(args.run_dir, 'run_report.md')} and run_report.json")
@@ -204,6 +321,10 @@ def cmd_report(args) -> None:
 
 
 def cmd_probe(args) -> None:
+    from .checkpoint import load_model
+    from .evaluation import context_probe, format_probe
+    from .hw import pick_device
+
     device = pick_device(args.device)
     model, cfg, _ = load_model(args.ckpt, device, use_ema=args.ema)
     print(cfg.describe())
@@ -213,6 +334,10 @@ def cmd_probe(args) -> None:
 
 
 def cmd_bench(args) -> None:
+    from .checkpoint import load_model
+    from .hw import pick_device
+    from .perf import benchmark_generation, format_generation_benchmark, format_sdpa_report, sdpa_backend_report
+
     device = pick_device(args.device)
     model, cfg, _ = load_model(args.ckpt, device)
     print(format_generation_benchmark(benchmark_generation(model, device, new_tokens=args.new_tokens)))
@@ -220,6 +345,9 @@ def cmd_bench(args) -> None:
 
 
 def cmd_continual(args) -> None:
+    from .hw import pick_device
+    from .workflow import compare_continual_strategies
+
     compare_continual_strategies(args.ckpt, args.old_dir, args.new_dir, steps=args.steps, replay_fraction=args.replay_fraction,
                                  ewc_lambda=args.ewc_lambda, ewc_kind=args.ewc_kind, batch_size=args.batch_size,
                                  learning_rate=args.learning_rate, seeds=[int(s) for s in args.seeds.split(",")],
@@ -227,6 +355,9 @@ def cmd_continual(args) -> None:
 
 
 def cmd_export(args) -> None:
+    from .checkpoint import load_model
+    from .export import export_safetensors, write_model_card
+
     model, cfg, ckpt = load_model(args.ckpt, "cpu", use_ema=args.ema)
     w, c = export_safetensors(model, cfg, args.out_dir, args.name, args.dtype)
     write_model_card(args.out_dir, cfg, args.name, metrics={"best_val_loss (nats/byte)": ckpt["best_val_loss"],
@@ -236,17 +367,30 @@ def cmd_export(args) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="tensegrity", description=f"TensegrityLM {__version__}")
+    ap.add_argument("--version", action="version", version=f"Tensegrity {__version__}")
     sub = ap.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("doctor", help="check installation, dependencies and device; optionally run an offline smoke test")
+    p.add_argument("--json", action="store_true", help="machine-readable diagnostic report")
+    p.add_argument("--smoke", action="store_true", help="test training, checkpoint reload, export and cached generation on CPU")
+    p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("convert-checkpoint", help="convert trusted legacy pickle weights to a safe v2 checkpoint")
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--out", required=True, help="new destination; must not already exist")
+    p.add_argument("--trust-legacy-pickle", action="store_true",
+                   help="allow arbitrary Python code in this input file to run; only for a checkpoint you trust")
+    p.set_defaults(fn=cmd_convert_checkpoint)
 
     sub.add_parser("presets", help="list the model-size ladder").set_defaults(fn=cmd_presets)
 
     p = sub.add_parser("prepare", help="tokenise text/markdown/parquet/jsonl into train.bin/val.bin")
     p.add_argument("--data_path", required=True)
     p.add_argument("--out_dir", required=True)
-    p.add_argument("--val_fraction", type=float, default=0.05)
+    p.add_argument("--val_fraction", type=_positive_probability, default=0.05)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--doc_sep", default=None, help="literal separator mapped to EOS, e.g. '<|endoftext|>'")
-    p.add_argument("--max_mb", type=float, default=None)
+    p.add_argument("--max_mb", type=_number, default=None)
     p.add_argument("--format", choices=["text", "jsonl", "parquet"], default=None,
                    help="force a reader for files with an unrecognised extension")
     p.add_argument("--text_field", default=None, help="jsonl key / parquet column holding the text (default: auto)")
@@ -257,10 +401,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--split", choices=["auto", "document", "tail"], default="auto",
                    help="document: hash each document into train/val; tail: last val_fraction of the stream; "
                         "auto: document when there are enough documents")
-    p.add_argument("--min_documents", type=int, default=50)
+    p.add_argument("--min_documents", type=_positive_int, default=50)
     p.add_argument("--dedup", action="store_true", help="drop exact duplicate documents (document split only)")
     p.add_argument("--no_validate_utf8", action="store_true")
-    p.add_argument("--max_reject_fraction", type=float, default=0.01,
+    p.add_argument("--max_reject_fraction", type=_probability, default=0.01,
                    help="fail if more than this fraction of a file's records is unusable")
     p.add_argument("--overwrite", action="store_true",
                    help="replace an existing different dataset in out_dir (the old files are moved aside)")
@@ -268,21 +412,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("audit", help="show a prepared dataset's manifest, integrity and decoded examples")
     p.add_argument("--data_dir", required=True)
-    p.add_argument("--examples", type=int, default=2)
+    p.add_argument("--examples", type=_nonnegative_int, default=2)
     p.add_argument("--deep", action="store_true", help="re-hash the token files against the manifest")
+    p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_audit)
 
     p = sub.add_parser("train", help="train or resume")
     p.add_argument("--preset", default="5m", help=f"ladder {list(LADDER_NAMES)} or legacy name")
     p.add_argument("--data_dir", required=True)
     p.add_argument("--out_dir", required=True)
-    p.add_argument("--hours", type=float, default=None, help="size the run to this wall-clock budget")
-    p.add_argument("--tokens", type=float, default=None, help="byte budget (default: preset's)")
+    p.add_argument("--hours", type=_number, default=None, help="size the run to this wall-clock budget")
+    p.add_argument("--tokens", type=_number, default=None, help="byte budget (default: preset's)")
     p.add_argument("--optimizer", choices=["muon", "adamw"], default="muon")
-    p.add_argument("--learning_rate", type=float, default=None)
-    p.add_argument("--micro_batch", type=int, default=None, help="skip autotune")
-    p.add_argument("--grad_accum", type=int, default=None)
-    p.add_argument("--max_minutes", type=float, default=None, help="stop cleanly after this long")
+    p.add_argument("--learning_rate", type=_number, default=None)
+    p.add_argument("--micro_batch", type=_positive_int, default=None, help="skip autotune")
+    p.add_argument("--grad_accum", type=_positive_int, default=None)
+    p.add_argument("--max_minutes", type=_number, default=None, help="stop cleanly after this long")
     p.add_argument("--no_resume", dest="resume", action="store_false")
     p.add_argument("--init_weights", default=None, help="start from these weights (e.g. a grown checkpoint)")
     p.add_argument("--device", default="auto")
@@ -302,11 +447,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="context before the prompt. eos (default) is what the model saw before every training "
                         "document; bos was never seen as input and degrades the first bytes")
     p.add_argument("--add_bos", action="store_true", help="deprecated alias for --start_token bos")
-    p.add_argument("--max_new_tokens", type=int, default=300)
-    p.add_argument("--temperature", type=float, default=0.8)
-    p.add_argument("--top_k", type=int, default=40)
-    p.add_argument("--top_p", type=float, default=None)
-    p.add_argument("--min_p", type=float, default=None)
+    p.add_argument("--max_new_tokens", type=_nonnegative_int, default=300)
+    p.add_argument("--temperature", type=_nonnegative_float, default=0.8)
+    p.add_argument("--top_k", type=_positive_int, default=40)
+    p.add_argument("--top_p", type=_positive_probability, default=None)
+    p.add_argument("--min_p", type=_probability, default=None)
     p.add_argument("--use_confidence_temp", action="store_true")
     p.add_argument("--no_stop_on_eos", action="store_true")
     p.add_argument("--no_kv_cache", action="store_true")
@@ -315,15 +460,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ema", action="store_true", help="use EMA weights if the checkpoint has them")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default="auto")
+    p.add_argument("--stream", action="store_true", help="print UTF-8 text as each byte is generated")
     p.set_defaults(fn=cmd_generate)
 
     p = sub.add_parser("eval", help="validation loss / bits-per-byte of a checkpoint")
     p.add_argument("--ckpt", required=True)
     p.add_argument("--data_dir", required=True)
-    p.add_argument("--eval_batches", type=int, default=50)
+    p.add_argument("--eval_batches", type=_positive_int, default=50)
     p.add_argument("--dtype", default="auto", choices=["auto", "float32", "bfloat16", "float16"])
     p.add_argument("--ema", action="store_true")
     p.add_argument("--device", default="auto")
+    p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_eval)
 
     p = sub.add_parser("grow", help="grow a checkpoint to the next ladder rung (function-preserving)")
@@ -337,9 +484,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("preflight", help="decisive pre-run report: size, attention reach, data, numerics, memory, reload")
     p.add_argument("--preset", default="5m", choices=list(LADDER_NAMES))
     p.add_argument("--data_dir", required=True)
-    p.add_argument("--tokens", type=float, default=None)
-    p.add_argument("--micro_batch", type=int, default=None)
-    p.add_argument("--grad_accum", type=int, default=None)
+    p.add_argument("--tokens", type=_number, default=None)
+    p.add_argument("--micro_batch", type=_positive_int, default=None)
+    p.add_argument("--grad_accum", type=_positive_int, default=None)
     p.add_argument("--optimizer", choices=["muon", "adamw"], default="muon")
     p.add_argument("--deep", action="store_true", help="re-hash the dataset files against their manifest")
     p.add_argument("--device", default="auto")
@@ -356,15 +503,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("probe", help="copy/retrieval probe at increasing distances, next to the layout's reach")
     p.add_argument("--ckpt", required=True)
     p.add_argument("--distances", default="0,16,64,256,1024")
-    p.add_argument("--key_len", type=int, default=12)
-    p.add_argument("--trials", type=int, default=64)
+    p.add_argument("--key_len", type=_positive_int, default=12)
+    p.add_argument("--trials", type=_positive_int, default=64)
     p.add_argument("--ema", action="store_true")
     p.add_argument("--device", default="auto")
     p.set_defaults(fn=cmd_probe)
 
     p = sub.add_parser("bench", help="generation latency per cache_mode and SDPA backend availability")
     p.add_argument("--ckpt", required=True)
-    p.add_argument("--new_tokens", type=int, default=64)
+    p.add_argument("--new_tokens", type=_positive_int, default=64)
     p.add_argument("--device", default="auto")
     p.set_defaults(fn=cmd_bench)
 
@@ -372,12 +519,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt", required=True)
     p.add_argument("--old_dir", required=True)
     p.add_argument("--new_dir", required=True)
-    p.add_argument("--steps", type=int, default=200)
-    p.add_argument("--replay_fraction", type=float, default=0.3)
-    p.add_argument("--ewc_lambda", type=float, default=100.0)
+    p.add_argument("--steps", type=_positive_int, default=200)
+    p.add_argument("--replay_fraction", type=_probability, default=0.3)
+    p.add_argument("--ewc_lambda", type=_nonnegative_float, default=100.0)
     p.add_argument("--ewc_kind", choices=["empirical", "sampled"], default="empirical")
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--learning_rate", type=float, default=1e-3)
+    p.add_argument("--batch_size", type=_positive_int, default=8)
+    p.add_argument("--learning_rate", type=_number, default=1e-3)
     p.add_argument("--seeds", default="0", help="comma-separated, e.g. 0,1,2")
     p.add_argument("--out_dir", default=None)
     p.add_argument("--device", default="auto")
@@ -394,8 +541,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list] = None) -> None:
-    args = build_parser().parse_args(argv)
-    args.fn(args)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "grad_accum", None) is not None and getattr(args, "micro_batch", None) is None:
+        parser.error("--grad_accum requires --micro_batch")
+    if getattr(args, "no_kv_cache", False) and getattr(args, "cache_mode", None) == "streaming":
+        parser.error("--cache_mode streaming requires the KV cache")
+    try:
+        args.fn(args)
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        raise SystemExit(130) from None
+    except (OSError, ValueError, ImportError) as exc:
+        parser.exit(1, f"tensegrity: {exc}\n")
 
 
 if __name__ == "__main__":

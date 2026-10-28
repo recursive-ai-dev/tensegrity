@@ -53,17 +53,20 @@ class ByteDataset:
 
     def __init__(self, data_dirs, weights: Optional[Sequence[float]] = None, seed: int = 1337, rank: int = 0,
                  on_change: str = "remap"):
-        if isinstance(data_dirs, str):
+        if isinstance(data_dirs, (str, os.PathLike)):
             data_dirs = [data_dirs]
-        self.data_dirs = list(data_dirs)
+        self.data_dirs = [os.fspath(d) for d in data_dirs]
         if not self.data_dirs:
             raise ValueError("data_dirs is empty")
         if on_change not in ("remap", "error"):
             raise ValueError(f"on_change must be 'remap' or 'error', got {on_change!r}")
         w = np.asarray(weights if weights is not None else [1.0] * len(self.data_dirs), dtype=np.float64)
-        if len(w) != len(self.data_dirs) or (w < 0).any() or w.sum() <= 0:
-            raise ValueError("weights must be non-negative, sum > 0, one per data dir")
-        self.weights = w / w.sum()
+        if (w.ndim != 1 or len(w) != len(self.data_dirs) or not np.isfinite(w).all()
+                or (w < 0).any() or not (w > 0).any()):
+            raise ValueError("weights must be finite, non-negative, sum > 0, one per data dir")
+        # Scaling before the sum also handles finite weights near float64's limit.
+        scaled = w / w.max()
+        self.weights = scaled / scaled.sum()
         self.rng = np.random.default_rng([seed, rank])
         self.on_change = on_change
         self.n_remaps = 0
@@ -120,8 +123,10 @@ class ByteDataset:
 
     # ----------------------------------------------------------------- sampling
     def _check(self, arr: np.ndarray, path: str, split: str, block_size: int) -> None:
-        if len(arr) <= block_size + 1:
-            raise ValueError(f"{path}/{split}.bin has only {len(arr)} tokens, need > block_size+1 "
+        if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size < 1:
+            raise ValueError(f"block_size must be a positive integer, got {block_size!r}")
+        if len(arr) < block_size + 1:
+            raise ValueError(f"{path}/{split}.bin has only {len(arr)} tokens, need > block_size "
                              f"({block_size + 1}). Use a larger corpus or a smaller block_size.")
 
     def _gather(self, arr: np.ndarray, starts: np.ndarray, block_size: int) -> Tuple[np.ndarray, np.ndarray]:

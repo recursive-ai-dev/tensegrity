@@ -1,0 +1,6 @@
+include README.md pytest.ini
+recursive-include tensegrity *.py
+recursive-include packaging *
+recursive-include tools *.py *.md *.log
+recursive-include notebooks *.ipynb
+recursive-include tests *.py *.pt

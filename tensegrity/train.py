@@ -178,6 +178,35 @@ class TrainConfig:
                   "weight_decay", "beta1", "beta2", "grad_clip", "muon_lr", "muon_momentum", "muon_weight_decay",
                   "use_8bit_optimizer", "ema_decay", "seed")
 
+    def __post_init__(self) -> None:
+        for name in ("batch_size", "grad_accum_steps", "log_interval", "eval_interval", "eval_batches",
+                     "eval_batch_size", "block_size"):
+            value = getattr(self, name)
+            if value is None and name == "block_size":
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        for name in ("sample_every_evals", "sample_len", "max_nonfinite", "seed"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        for name in ("learning_rate", "min_lr", "weight_decay", "beta1", "beta2", "grad_clip", "muon_lr",
+                     "muon_momentum", "muon_weight_decay", "ema_decay", "ckpt_interval_minutes", "max_minutes"):
+            value = getattr(self, name)
+            if value is None and name in ("muon_weight_decay", "max_minutes"):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number, got {value!r}")
+            if name != "grad_clip" and value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value!r}")
+        for name in ("beta1", "beta2", "muon_momentum", "ema_decay"):
+            if not 0 <= getattr(self, name) < 1:
+                raise ValueError(f"{name} must be in [0, 1), got {getattr(self, name)!r}")
+        if self.optimizer not in ("adamw", "muon"):
+            raise ValueError(f"optimizer must be 'adamw' or 'muon', got {self.optimizer!r}")
+        if self.dtype not in ("auto", "float32", "fp32", "float16", "fp16", "bfloat16", "bf16"):
+            raise ValueError(f"unsupported dtype {self.dtype!r}")
+
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
 
@@ -334,7 +363,8 @@ class Trainer:
         self._log_file = None
         self.cfg: TensegrityConfig = model.cfg
         self.tc, self.plan = tc, plan
-        self.data_dirs = [data_dirs] if isinstance(data_dirs, str) else list(data_dirs)
+        self.data_dirs = ([os.fspath(data_dirs)] if isinstance(data_dirs, (str, os.PathLike))
+                          else [os.fspath(d) for d in data_dirs])
         self.data_weights = data_weights
         self.out_dir = out_dir
         self.device_arg = device
@@ -683,8 +713,17 @@ class Trainer:
                     self.scaler.unscale_(self.optimizer)
                 gnorm = (torch.nn.utils.clip_grad_norm_(self.raw_model.parameters(), tc.grad_clip)
                          if tc.grad_clip > 0 else None)
-                probe = gnorm if gnorm is not None else sums["total_loss"]
-                finite = bool(torch.isfinite(probe))
+                if gnorm is not None:
+                    probe = gnorm
+                else:
+                    # A finite loss does not guarantee finite gradients (e.g. a
+                    # singular derivative or a custom loss). Disabling clipping
+                    # must not disable the protection against poisoning weights.
+                    checks = [torch.isfinite(sums["total_loss"])]
+                    checks.extend(torch.isfinite(p.grad).all() for p in self.raw_model.parameters()
+                                  if p.grad is not None)
+                    probe = torch.stack(checks).all()
+                finite = bool(torch.isfinite(probe)) if gnorm is not None else bool(probe)
                 if self.scaler.is_enabled():
                     self.scaler.step(self.optimizer)   # skips itself on inf/nan gradients
                     self.scaler.update()

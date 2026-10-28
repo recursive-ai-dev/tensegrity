@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from .config import TensegrityConfig
+from .checkpoint import _atomic_output, unwrap_model
 from .model import TensegrityLM
 
 _DTYPES = {"float32": torch.float32, "fp32": torch.float32, "float16": torch.float16, "fp16": torch.float16,
@@ -29,7 +30,13 @@ def export_safetensors(model: TensegrityLM, cfg: Optional[TensegrityConfig] = No
     * ``dtype``: "float32" (lossless), "float16" or "bfloat16" for a smaller deployment copy.
     """
     from safetensors.torch import save_file
+    model = unwrap_model(model)
     cfg = cfg or model.cfg
+    if cfg.to_dict() != model.cfg.to_dict():
+        raise ValueError("export config does not match the model's config")
+    if (not isinstance(name, str) or not name or name in (".", "..")
+            or any(char in name for char in ("/", "\\", "\x00"))):
+        raise ValueError("name must be a nonempty filename stem, without path separators")
     if dtype not in _DTYPES:
         raise ValueError(f"dtype must be one of {sorted(set(_DTYPES))}, got {dtype!r}")
     target = _DTYPES[dtype]
@@ -43,12 +50,19 @@ def export_safetensors(model: TensegrityLM, cfg: Optional[TensegrityConfig] = No
     meta = {"format": "pt", "architecture": "TensegrityLM", "tensegrity_config": json.dumps(cfg.to_dict()),
             "dtype": dtype, "n_params": str(model.num_parameters())}
     if extra_metadata:
+        collisions = set(extra_metadata) & set(meta)
+        if collisions:
+            raise ValueError(f"extra_metadata cannot replace export fields: {sorted(collisions)}")
         meta.update({k: str(v) for k, v in extra_metadata.items()})
     weights_path = os.path.join(out_dir, f"{name}.safetensors")
-    save_file(tensors, weights_path, metadata=meta)
     config_path = os.path.join(out_dir, f"{name}.config.json")
-    with open(config_path, "w") as fh:
-        json.dump(cfg.to_dict(), fh, indent=2)
+    # Stage both before publication. Each file is replaced atomically; the embedded
+    # config makes the weights usable independently of a sidecar after interruption.
+    with _atomic_output(weights_path) as staged_weights:
+        save_file(tensors, staged_weights, metadata=meta)
+        with _atomic_output(config_path) as staged_config:
+            with open(staged_config, "w", encoding="utf-8") as fh:
+                json.dump(cfg.to_dict(), fh, indent=2)
     return weights_path, config_path
 
 
@@ -57,19 +71,24 @@ def load_safetensors(weights_path: str, config_path: Optional[str] = None, devic
     """Rebuild a model from a ``.safetensors`` file (config from ``config_path`` or the file header)."""
     from safetensors import safe_open
     from safetensors.torch import load_file
+    with safe_open(weights_path, framework="pt") as f:
+        raw = (f.metadata() or {}).get("tensegrity_config")
+    embedded = json.loads(raw) if raw is not None else None
     if config_path is not None:
-        with open(config_path) as fh:
+        with open(config_path, encoding="utf-8") as fh:
             cfg_dict = json.load(fh)
+        if embedded is not None and embedded != cfg_dict:
+            raise ValueError(f"{config_path} does not match the embedded config in {weights_path}")
     else:
-        with safe_open(weights_path, framework="pt") as f:
-            raw = (f.metadata() or {}).get("tensegrity_config")
-        if raw is None:
+        if embedded is None:
             raise ValueError(f"{weights_path} has no embedded config; pass config_path=")
-        cfg_dict = json.loads(raw)
+        cfg_dict = embedded
     cfg = TensegrityConfig.from_dict(cfg_dict, strict=True)
     model = TensegrityLM(cfg)
     state = load_file(weights_path)
-    state.pop("lm_head.weight", None)  # tied to token_emb.weight
+    head = state.pop("lm_head.weight", None)  # tied to token_emb.weight in legacy exports
+    if head is not None and ("token_emb.weight" not in state or not torch.equal(head, state["token_emb.weight"])):
+        raise ValueError(f"{weights_path}: tied lm_head.weight and token_emb.weight disagree")
     missing, unexpected = model.load_state_dict(state, strict=False)
     missing = [k for k in missing if k != "lm_head.weight"]
     if missing or unexpected:

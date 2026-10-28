@@ -21,7 +21,7 @@ def test_v1_checkpoint_loads_and_reproduces_original_outputs():
     path = os.path.join(ASSETS, "legacy_v1.pt")
     expected = torch.load(os.path.join(ASSETS, "legacy_v1_expected.pt"), weights_only=True)
     with pytest.warns(UserWarning, match="legacy"):
-        ckpt = load_checkpoint(path)
+        ckpt = load_checkpoint(path, allow_legacy_pickle=True)
     assert ckpt["format_version"] == 1 and ckpt["step"] == 6
     cfg = TensegrityConfig.from_dict(ckpt["config"])
     assert (cfg.byte_mix_kernel, cfg.x0_mix, cfg.confidence_detach) == (0, False, False)  # legacy behaviour
@@ -38,7 +38,7 @@ def test_v1_checkpoint_loads_and_reproduces_original_outputs():
 
 
 def test_v1_optimizer_state_loads_into_new_muon():
-    ckpt = load_checkpoint(os.path.join(ASSETS, "legacy_v1.pt"))
+    ckpt = load_checkpoint(os.path.join(ASSETS, "legacy_v1.pt"), allow_legacy_pickle=True)
     model = TensegrityLM(TensegrityConfig.from_dict(ckpt["config"]))
     opt = model.configure_optimizer(0.1, 3e-3, (0.9, 0.95), "cpu", use_muon=True, muon_lr=0.02)
     opt.load_state_dict(ckpt["optimizer_state_dict"])         # same group layout as v1

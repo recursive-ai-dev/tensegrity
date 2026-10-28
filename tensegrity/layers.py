@@ -378,9 +378,9 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                 x0: Optional[torch.Tensor] = None, v0: Optional[torch.Tensor] = None,
-                loop_idx: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-        x, homeo, _ = self._forward_impl(x, cos, sin, x0, v0, loop_idx, need_v0=False)
-        return x, homeo
+                loop_idx: int = 0, return_v0: bool = False):
+        x, homeo, v0_out = self._forward_impl(x, cos, sin, x0, v0, loop_idx, need_v0=return_v0 and v0 is None)
+        return (x, homeo, v0_out) if return_v0 else (x, homeo)
 
     def forward_incremental(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                             x0: Optional[torch.Tensor], past: Optional[KV], max_cache: Optional[int] = None,

@@ -280,3 +280,58 @@ def test_model_card_and_int8(tmp_path):
         pytest.skip("dynamic quantisation not available in this torch build")
     out = q.generate(torch.randint(0, 256, (1, 4)), 8, temperature=0.0, stop_on_eos=False)
     assert out.shape == (1, 12)
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "../escape", "nested/model", "nested\\model"])
+def test_export_rejects_path_in_model_name(tmp_path, name):
+    model = TensegrityLM(small_cfg())
+    with pytest.raises(ValueError, match="filename stem"):
+        export_safetensors(model, out_dir=tmp_path, name=name)
+
+
+def test_export_cannot_publish_a_different_config_or_override_metadata(tmp_path):
+    model = TensegrityLM(small_cfg())
+    with pytest.raises(ValueError, match="does not match"):
+        export_safetensors(model, model.cfg.replace(dropout=0.1), out_dir=tmp_path)
+    with pytest.raises(ValueError, match="cannot replace"):
+        export_safetensors(model, out_dir=tmp_path, extra_metadata={"tensegrity_config": "{}"})
+
+
+def test_safetensors_rejects_sidecar_from_a_different_model(tmp_path):
+    model = TensegrityLM(small_cfg())
+    weights, config = export_safetensors(model, out_dir=tmp_path)
+    with open(config, "w") as stream:
+        json.dump(model.cfg.replace(dropout=0.1).to_dict(), stream)
+    with pytest.raises(ValueError, match="does not match the embedded config"):
+        load_safetensors(weights, config)
+    loaded, cfg = load_safetensors(weights)
+    assert loaded.cfg == cfg == model.cfg
+
+
+def test_safetensors_rejects_conflicting_tied_weights(tmp_path):
+    from safetensors.torch import save_file
+    model = TensegrityLM(small_cfg())
+    state = {k: v.detach().clone().contiguous() for k, v in model.state_dict().items()}
+    state["lm_head.weight"].add_(1)
+    weights = str(tmp_path / "conflict.safetensors")
+    save_file(state, weights, metadata={"tensegrity_config": json.dumps(model.cfg.to_dict())})
+    with pytest.raises(ValueError, match="tied .* disagree"):
+        load_safetensors(weights)
+
+
+def test_failed_export_keeps_previous_weights_and_config(tmp_path, monkeypatch):
+    import safetensors.torch
+    model = randomized(TensegrityLM(small_cfg()))
+    weights, config = export_safetensors(model, out_dir=tmp_path)
+    before = {p: open(p, "rb").read() for p in (weights, config)}
+
+    def fail(tensors, filename, metadata):
+        with open(filename, "wb") as stream:
+            stream.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(safetensors.torch, "save_file", fail)
+    with pytest.raises(OSError, match="disk full"):
+        export_safetensors(model, out_dir=tmp_path)
+    assert {p: open(p, "rb").read() for p in (weights, config)} == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["model.config.json", "model.safetensors"]

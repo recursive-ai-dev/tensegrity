@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Tensegrity
+Source: https://github.com/recursive-ai-dev/tensegrity
+Disclaimer: This is a local package, not an official Debian distribution package.
+
+Files: *
+Copyright: Tensegrity contributors; individual copyright notices, if any,
+ are retained in the source files.
+License: unspecified
+ No upstream license grant was included in the repository when this packaging
+ was added. This packaging does not supply or infer redistribution permission.
+ If the project owner adds a LICENSE file, the build includes it verbatim in
+ /usr/share/doc/tensegrity-lm/LICENSE. Review that license before redistribution.

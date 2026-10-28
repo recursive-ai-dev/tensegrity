@@ -358,3 +358,69 @@ def test_rope_tables_not_in_state_dict_and_fp32_after_half():
     m.half()
     cos, sin = m._rope_tables(torch.device("cpu"))
     assert cos.dtype == torch.float32
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"max_new_tokens": -1}, {"max_new_tokens": 1.5}, {"max_new_tokens": True},
+    {"temperature": float("nan")}, {"temperature": float("inf")},
+    {"top_k": 1.5}, {"top_k": True}, {"top_p": 0.0}, {"top_p": 1.01},
+    {"top_p": float("nan")}, {"min_p": -0.1}, {"min_p": 1.1},
+    {"min_p": float("nan")}, {"conf_temp_min": 0.0},
+    {"conf_temp_min": 2.0, "conf_temp_max": 1.0}, {"conf_temp_max": float("inf")},
+    {"rebuild_stride": 1.5},
+])
+def test_generation_rejects_invalid_sampling_arguments(kwargs):
+    model = TensegrityLM(small_cfg()).train()
+    prompt = torch.zeros((1, 2), dtype=torch.long)
+    options = {"max_new_tokens": 2, **kwargs}
+    with pytest.raises(ValueError):
+        model.generate(prompt, **options)
+    with pytest.raises(ValueError):
+        list(model.stream(prompt, **options))
+    assert model.training
+
+
+@pytest.mark.parametrize("cache_mode", ["window", "streaming"])
+def test_zero_token_generation_never_runs_inference(cache_mode, monkeypatch):
+    model = TensegrityLM(small_cfg()).train()
+    prompt = torch.zeros((1, 2), dtype=torch.long)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("zero tokens must not run forward")
+
+    monkeypatch.setattr(model, "forward", unexpected)
+    monkeypatch.setattr(model, "forward_incremental", unexpected)
+    assert torch.equal(model.generate(prompt, 0, cache_mode=cache_mode), prompt)
+    assert list(model.stream(prompt, 0, cache_mode=cache_mode)) == []
+    assert model.training
+
+
+@pytest.mark.parametrize("cache_mode", ["window", "streaming"])
+def test_closing_a_generation_stream_restores_model_mode(cache_mode):
+    model = TensegrityLM(small_cfg()).train()
+    prompt = torch.zeros((1, 2), dtype=torch.long)
+    iterator = model.stream(prompt, 10, stop_on_eos=False, cache_mode=cache_mode)
+    next(iterator)
+    iterator.close()
+    assert model.training and torch.is_grad_enabled()
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
+@pytest.mark.parametrize("value_residual", [False, True])
+def test_training_dispatches_block_hooks_with_and_without_checkpointing(checkpointing, value_residual):
+    cfg = small_cfg(grad_checkpoint=checkpointing, grad_checkpoint_every=1, v0_mix=value_residual, n_loops=2)
+    model = TensegrityLM(cfg).train()
+    events = []
+    handles = [block.register_forward_hook(lambda module, args, result: events.append(module))
+               for block in model.blocks]
+    prompt = torch.randint(0, 256, (1, 12))
+    try:
+        _, loss, _ = model(prompt, prompt)
+        assert len(events) == cfg.n_layer * cfg.n_loops
+        assert all(events.count(block) == cfg.n_loops for block in model.blocks)
+        loss["total_loss"].backward()
+        assert all(parameter.grad is not None for name, parameter in model.named_parameters()
+                   if "confidence_head" not in name)
+    finally:
+        for handle in handles:
+            handle.remove()

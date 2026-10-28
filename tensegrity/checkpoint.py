@@ -9,9 +9,11 @@ Format v2 differences from v1 (readers of v1 files are fully supported):
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pickle
 import random
+import tempfile
 import warnings
 from typing import Any, Dict, Optional, Tuple
 
@@ -59,7 +61,7 @@ def environment_info() -> Dict[str, str]:
     guaranteed identical across releases or platforms)."""
     import platform
     from . import __version__
-    return {"tensegrity": __version__, "torch": torch.__version__, "numpy": np.__version__,
+    return {"tensegrity": str(__version__), "torch": str(torch.__version__), "numpy": str(np.__version__),
             "python": platform.python_version(), "platform": platform.platform()}
 
 
@@ -106,7 +108,7 @@ def restore_rng_state(state: Optional[Dict[str, Any]], model: Optional[nn.Module
         ns = state["numpy"]
         try:
             if isinstance(ns, dict):
-                np.random.set_state((ns["name"], ns["keys"].numpy().astype(np.uint32),
+                np.random.set_state((ns["name"], ns["keys"].cpu().numpy().astype(np.uint32),
                                      ns["pos"], ns["has_gauss"], ns["cached"]))
             else:
                 np.random.set_state(ns)
@@ -134,17 +136,38 @@ def restore_rng_state(state: Optional[Dict[str, Any]], model: Optional[nn.Module
 # save / load
 # =============================================================================
 
+@contextlib.contextmanager
+def _atomic_output(path):
+    """Stage one file beside its destination and publish only a completed write.
+
+    Unique temporary files allow concurrent writers and avoid following a predictable
+    ``.tmp`` symlink. An unsuccessful write leaves the previous destination intact.
+    """
+    path = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    os.close(fd)
+    try:
+        yield temporary
+        with open(temporary, "rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def atomic_torch_save(obj: Any, path: str) -> None:
-    """torch.save to ``path + '.tmp'``, fsync, then atomic rename: a crash (or a Colab
-    disconnect) mid-write can never leave a truncated file that looks like a checkpoint."""
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    tmp = path + ".tmp"
-    torch.save(obj, tmp)
-    with open(tmp, "r+b") as f:
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """Write and fsync a unique temporary file, then atomically replace ``path``."""
+    with _atomic_output(path) as temporary:
+        torch.save(obj, temporary)
 
 
 def save_checkpoint(path: str, model: nn.Module, optimizer: Optional[torch.optim.Optimizer],
@@ -168,49 +191,64 @@ def save_checkpoint(path: str, model: nn.Module, optimizer: Optional[torch.optim
         "rng_state": rng_state,
     }
     if extra:
+        collisions = set(extra) & set(ckpt)
+        if collisions:
+            raise ValueError(f"extra cannot replace checkpoint fields: {sorted(collisions)}")
         ckpt.update(extra)
     atomic_torch_save(ckpt, path)
 
 
-def load_checkpoint(path: str, device: str = "cpu", allow_legacy_pickle: bool = True) -> Dict[str, Any]:
+def load_checkpoint(path: str, device: str = "cpu", allow_legacy_pickle: bool = False) -> Dict[str, Any]:
     """
     Load a checkpoint dict. v2 files load under ``weights_only=True``. Files written by the
     original release (v1) contain numpy RNG objects and need full unpickling; that is only
-    attempted when ``allow_legacy_pickle`` is True, with a warning -- **only load checkpoint
+    attempted when ``allow_legacy_pickle=True`` is explicitly passed, with a warning -- **only load checkpoint
     files you trust** (pickle can execute code).
     """
     try:
         ckpt = torch.load(path, map_location=device, weights_only=True)
-    except (pickle.UnpicklingError, RuntimeError, AttributeError, ValueError) as e:
+    except pickle.UnpicklingError as e:
         if not allow_legacy_pickle:
-            raise
+            raise ValueError(
+                f"{path} could not be loaded safely. Unrestricted pickle loading is disabled. "
+                "For a trusted legacy checkpoint only, pass allow_legacy_pickle=True to load_checkpoint/load_model "
+                "or migrate it with tensegrity convert-checkpoint --trust-legacy-pickle."
+            ) from e
         warnings.warn(f"{os.path.basename(path)}: not loadable with weights_only=True ({type(e).__name__}); "
                       f"treating it as a legacy (v1) checkpoint and unpickling it. Only do this for files you trust.",
                       stacklevel=2)
         ckpt = torch.load(path, map_location=device, weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise ValueError(f"{path} must contain a checkpoint dictionary, got {type(ckpt).__name__}.")
     missing = [k for k in _REQUIRED if k not in ckpt]
     if missing:
         raise ValueError(f"{path} is missing checkpoint key(s) {missing}; not a TensegrityLM checkpoint.")
-    ckpt["model_state_dict"] = normalize_state_dict(ckpt["model_state_dict"])
-    ver = ckpt.get("format_version")
+    if not isinstance(ckpt["config"], dict):
+        raise ValueError(f"{path}: config must be a dictionary.")
+    state = ckpt["model_state_dict"]
+    if not isinstance(state, dict) or not all(isinstance(k, str) and isinstance(v, torch.Tensor)
+                                              for k, v in state.items()):
+        raise ValueError(f"{path}: model_state_dict must map parameter names to tensors.")
+    ckpt["model_state_dict"] = normalize_state_dict(state)
+    ver = ckpt.get("format_version", 1)
     if ver not in (1, CHECKPOINT_FORMAT_VERSION):
-        warnings.warn(f"{path} has format_version={ver!r}; this code reads 1 and {CHECKPOINT_FORMAT_VERSION}.")
+        raise ValueError(f"{path} has unsupported format_version={ver!r}; this code reads 1 and {CHECKPOINT_FORMAT_VERSION}.")
     return ckpt
 
 
 def load_model(path: str, device: str = "cpu", use_ema: bool = False, verbose: bool = False,
-               strict_config: bool = True) -> Tuple[TensegrityLM, TensegrityConfig, Dict[str, Any]]:
+               strict_config: bool = True, allow_legacy_pickle: bool = False
+               ) -> Tuple[TensegrityLM, TensegrityConfig, Dict[str, Any]]:
     """Build the model described by a checkpoint and load its weights. ``use_ema=True`` loads
     the EMA weights when the checkpoint has them. A config field this release does not know is an
     error (``strict_config=False`` drops it with a warning instead)."""
-    ckpt = load_checkpoint(path, device)
+    ckpt = load_checkpoint(path, device, allow_legacy_pickle=allow_legacy_pickle)
     cfg = TensegrityConfig.from_dict(ckpt["config"], strict=strict_config)
     model = TensegrityLM(cfg, verbose=verbose)
     state = ckpt["model_state_dict"]
+    model.load_state_dict(state)
     if use_ema and ckpt.get("ema_state_dict"):
         from .train import EMA  # local import: train imports this module
         EMA.apply_state_to_model(ckpt["ema_state_dict"], model)
-    else:
-        model.load_state_dict(state)
     model.to(device)
     return model, cfg, ckpt

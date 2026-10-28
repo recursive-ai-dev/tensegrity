@@ -10,6 +10,64 @@ Tensegrity reads and writes raw UTF-8 bytes (vocabulary 259), so there is no tok
 Open the notebook in Colab → pick a size → Run all.
 ```
 
+## Install on Debian / Ubuntu
+
+Release **2.2** adds native Debian packaging and an offline installation check.
+The package targets Debian 13+ and Ubuntu releases with PyTorch ≥2.3, NumPy ≥1.23
+and safetensors ≥0.4 in their repositories (including Ubuntu 26.04).
+
+```bash
+# Build with Python 3.11+ and dpkg-deb; no root or Python dependencies needed.
+python3 tools/build_deb.py
+sudo apt install ./dist/tensegrity-lm_2.2.0-1_all.deb
+tensegrity --version
+tensegrity doctor --smoke
+tensegrity presets
+```
+
+APT installs the runtime dependencies. The package includes the command, Python
+library, manual and documentation; it downloads no models and starts no services.
+Use `sudo apt remove tensegrity-lm` to uninstall. Your datasets and checkpoints
+stay in the directories you selected. Build details, reproducibility controls
+and optional integrations are documented in [packaging/README.md](packaging/README.md).
+
+For a CUDA-specific PyTorch build, keep using a Python virtual environment with
+your preferred PyTorch installation. Both installations expose the same CLI.
+
+## What changed in 2.2
+
+* **Safe checkpoint loading by default.** Loading never silently retries with
+  unrestricted pickle. A trusted v1 checkpoint can be converted once with
+  `tensegrity convert-checkpoint --ckpt old.pt --out safe.pt --trust-legacy-pickle`.
+  Conversion writes model weights, architecture and progress metadata; optimizer
+  and RNG state are omitted. The Python loaders also accept explicit
+  `allow_legacy_pickle=True` for trusted legacy files.
+* **More reliable artifacts.** Checkpoint writes use unique temporary files and
+  clean up after failure. Export validates names, configuration and metadata;
+  safetensors loading detects conflicting configs or tied weights. Block forward
+  hooks work with recursive passes and gradient checkpointing. Partial EMA
+  checkpoints retain the remaining base-model weights.
+* **Stronger data and training checks.** Concurrent dataset preparation uses
+  separate staging directories and guarded publication; replacement backups are
+  unique. Re-preparing identical data checks the existing files for corruption.
+  Malformed manifests, invalid shapes and non-finite hyperparameters fail early;
+  training also rejects non-finite gradients when clipping is disabled. CLI training
+  seeds model initialization as well as training, so `--seed` covers a fresh run. The sampler
+  accepts an exact-size window, and recursive local models report their full reach.
+  The corrected quick hash changes identities for legacy datasets with token files
+  between 1 and 2 MiB; resuming those runs requires explicit `on_data_change="adopt"`.
+* **CLI improvements.** `--help` and `--version` work without loading PyTorch.
+  `doctor --json` diagnoses dependencies, versions and the selected device;
+  `doctor --smoke` tests a CPU optimizer update, checkpoint and safetensors reloads,
+  UTF-8 and cached decoding past the context window. `generate --stream` prints
+  text incrementally without splitting UTF-8 characters. `audit --json` and
+  `eval --json` expose structured results; evaluation labels actual bits per byte
+  separately from bits per target token. Invalid arguments and missing files
+  produce concise errors.
+* **Reproducible Debian builds.** `tools/build_deb.py` builds without pip or root,
+  normalizes ownership and timestamps, and writes a SHA-256 checksum beside the
+  `.deb`. CI builds distributable artifacts and checks package reproducibility.
+
 ## The size ladder
 
 | size | parameters | layers × width | heads (q/kv) | FFN | context | default byte budget |
@@ -117,7 +175,7 @@ Block:  x ← x + g_x0   · x0                          Attn = GQA, RoPE, Q/K-RM
 * **GQA** uses SDPA's native `enable_gqa` only where it reaches the FlashAttention kernel (Ampere+, fp16/bf16). On a T4 the memory-efficient kernel has no GQA support, so K/V are expanded instead — otherwise SDPA silently falls back to the O(T²)-memory math kernel.
 * **LayerDrop** draws all layer-skip decisions from a private CPU generator once per forward — no GPU sync, no per-block collective, identical across DDP ranks, and checkpointable.
 * **Generation** has an exact KV cache (token-for-token identical to uncached decoding, including past the context window), streaming output, top-k / top-p / min-p, and a **confidence head** whose scores can lower or raise the sampling temperature per token and shade the text in the notebook. Past the context window `cache_mode="window"` (default) stays exact by re-encoding the window every byte; `cache_mode="streaming"` keeps a bounded KV cache at absolute RoPE positions and costs O(1) per byte, but is only an approximation there (stale deeper-layer states, ByteMix left context) — `long_stream_nll` measures the gap on your text.
-* **Reach is reported, not assumed.** `TensegrityConfig.receptive_field()` is the longest dependency the layout can express (a stack of local layers only sees `1 + n_layer·(window−1)` bytes; one global layer sees the whole context). `describe()`, `preflight` and the notebook print it and flag local-only layouts.
+* **Reach is reported, not assumed.** `TensegrityConfig.receptive_field()` is the longest dependency the layout can express (a stack of local layers only sees `1 + n_layer·n_loops·(window−1)` bytes; one global layer sees the whole context). `describe()`, `preflight` and the notebook print it and flag local-only layouts.
 
 ### Honest scope
 
@@ -221,10 +279,10 @@ The original release was a single notebook that wrote two modules to disk. I kep
 | 6 | `compute_fisher_diagonal(model="<path string>")` in the notebook; Fisher from an 8-sequence *batch mean* gradient. | Crash; Fisher under-estimated by ~batch size. | Per-sequence empirical Fisher in fp32; the notebook rewritten. |
 | 7 | RMSNorm `eps` handling in growth ignored `embed_scale`. | Small residual mismatch hidden by a loose `atol=1e-3`. | Derived the exact rule (ε unchanged when `embed_scale`, scaled by D0/D1 otherwise), stored in `norm_eps`; growth now preserves logits to ~1e-6. |
 | 8 | Notebook: Kaggle paths, hard-coded Drive checkpoint names, a `torch.cuda.memory._dump_snapshot` without recording, duplicated/outdated `grow_model` cell, monkey-patched RNG restore, TinyStories `<|endoftext|>` spelled as 13 bytes. | Not runnable top-to-bottom; the EOS token was never trained. | Replaced by a generated, tested notebook; `doc_sep` maps separators to the real EOS token. |
-| 9 | Checkpoints required full unpickling (`weights_only=False`). | Arbitrary-code risk when loading a shared checkpoint. | v2 checkpoints store RNG state as tensors/ints and load with `weights_only=True`; v1 files still load (with a warning). |
+| 9 | Checkpoints required full unpickling (`weights_only=False`). | Arbitrary-code risk when loading a shared checkpoint. | v2 checkpoints store RNG state as tensors/ints and load with `weights_only=True`; trusted v1 files load with explicit `allow_legacy_pickle=True` (and a warning). |
 | 10 | Validation drew fresh random windows each time; sampling used the global NumPy RNG. | Noisy "best checkpoint" selection; eval frequency changed training batches. | Fixed validation windows; private, checkpointable sampler. Resume is **bit-exact** (tested with LayerDrop, dropout, EMA, ByteMix). |
 
-**Compatibility.** Parameter names and shapes are unchanged for every v1 feature and every new config field defaults to the v1 behaviour, so v1 checkpoints load as the same network. A real checkpoint written by the original code (Muon optimizer, numpy RNG objects) is a test asset (`tests/assets/legacy_v1.pt`): logits, confidence and sampled text match to float tolerance. The original named presets keep their exact parameter counts (15,867,401 / 133,200,409 / 403,107,361).
+**Compatibility.** Parameter names and shapes are unchanged for every v1 feature and every new config field defaults to the v1 behaviour, so trusted v1 checkpoints load as the same network when explicitly allowed, or after conversion to v2. A real checkpoint written by the original code (Muon optimizer, numpy RNG objects) is a test asset (`tests/assets/legacy_v1.pt`): logits, confidence and sampled text match to float tolerance. The original named presets keep their exact parameter counts (15,867,401 / 133,200,409 / 403,107,361).
 
 ## Repository layout
 
@@ -238,10 +296,12 @@ tensegrity/            the package (notebook embeds these files verbatim)
   workflow.py ladder.py presets.py              grow_transaction + continual comparison, ladder, size table
   report.py perf.py                             preflight / run reports, generation + SDPA + host-sync profiling
   analysis.py export.py viz.py colab.py cli.py  calibration, safetensors, dashboard, Colab helpers, CLI
+  diagnostics.py                                dependency report + offline CPU smoke test
 notebooks/Tensegrity_Colab.ipynb                generated from tools/nb/* + the package (do not edit by hand)
 tools/build_notebook.py                         regenerate / --check the notebook
+tools/build_deb.py packaging/                    reproducible native Debian package + manual
 tools/ablate.py tools/ladder_vs_scratch.py      the experiments quoted above (+ their raw logs)
-tests/                                          305 tests: attention vs dense reference, KV-cache + streaming exactness,
+tests/                                          tests: attention vs dense reference, KV-cache + streaming exactness,
                                                 bit-exact resume + resume refusals, growth audit + transaction, data integrity,
                                                 evaluation, v1/2.0 compatibility, DDP, notebook execution
 ```

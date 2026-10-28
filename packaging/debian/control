@@ -1,0 +1,17 @@
+Package: tensegrity-lm
+Version: {version}
+Section: science
+Priority: optional
+Architecture: all
+Maintainer: {maintainer}
+Installed-Size: {installed_size}
+Depends: python3:any (>= {python_minimum}), python3-torch (>= 2.3), python3-numpy (>= 1.23), python3-safetensors (>= 0.4)
+Suggests: python3-pyarrow, python3-matplotlib, python3-ipython
+Homepage: https://github.com/recursive-ai-dev/tensegrity
+Description: byte-level language models with a trainable growth ladder
+ Train, evaluate, generate, grow and export byte-level PyTorch language models
+ from 1M to 115M parameters. Includes dataset integrity auditing, preflight
+ checks, resumable training, continual learning tools and run reports.
+ .
+ Models and training data are supplied by the user. The package does not
+ download models, create services or install Python dependencies with pip.
