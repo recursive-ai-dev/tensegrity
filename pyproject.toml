@@ -20,4 +20,4 @@ dev = ["pytest", "pyarrow", "matplotlib", "nbformat", "nbclient", "ipykernel"]
 tensegrity = "tensegrity.cli:main"
 
 [tool.setuptools]
-packages = ["tensegrity"]
+packages = ["tensegrity", "tensegrity.symbolic"]
