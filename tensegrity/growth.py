@@ -91,6 +91,9 @@ def _rescale_map(oc: TensegrityConfig, nc: TensegrityConfig) -> Dict[str, float]
         if gain_scale != 1.0:
             out[f"blocks.{i}.attn_gain"] = gain_scale
             out[f"blocks.{i}.ffn_gain"] = gain_scale
+            if oc.n_loops > 1:
+                out[f"blocks.{i}.loop_attn_gains"] = gain_scale
+                out[f"blocks.{i}.loop_ffn_gains"] = gain_scale
     return out
 
 
@@ -159,7 +162,10 @@ def verify_growth_mapping(old_model: nn.Module, new_model: nn.Module, rescale: O
         problems.append("lm_head.weight is no longer tied to token_emb.weight")
     old_layers = 1 + max((int(k.split(".")[1]) for k in old_sd if k.startswith("blocks.")), default=-1)
     new_only = sorted(k for k in new_sd if k not in old_sd)
-    stray = [k for k in new_only if not (k.startswith("blocks.") and int(k.split(".")[1]) >= old_layers)]
+    # growing n_loops from 1 creates per-pass gains inside the EXISTING blocks; nothing else may appear there
+    loop_keys = (".loop_attn_gains", ".loop_ffn_gains", ".loop_x0_gains")
+    stray = [k for k in new_only if not (k.startswith("blocks.") and
+                                         (int(k.split(".")[1]) >= old_layers or k.endswith(loop_keys)))]
     if stray:
         problems.append(f"new state outside the appended blocks: {stray[:6]} (a locked field changed the architecture?)")
     if problems:
@@ -314,14 +320,9 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
                new_n_layer: Optional[int] = None, ffn_growth_mult: Optional[float] = None,
                new_n_embd: Optional[int] = None, new_n_head: Optional[int] = None,
                new_n_kv_head: Optional[int] = None, new_block_size: Optional[int] = None,
-<<<<<<< HEAD
                new_n_loops: Optional[int] = None,
-               device: Optional[Union[str, torch.device]] = None, seed: Optional[int] = 0
-               ) -> Tuple[TensegrityLM, TensegrityConfig]:
-=======
                device: Optional[Union[str, torch.device]] = None, seed: Optional[int] = 0,
                return_report: bool = False):
->>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
     """
     Return ``(new_model, new_cfg)``: a larger model that, at the moment of growth, computes the
     same function as ``old_model`` (within float rounding) and whose new capacity is trainable.
@@ -402,14 +403,11 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
         blk.ffn_gain.zero_()
         if blk.x0_gain is not None:
             blk.x0_gain.zero_()
-<<<<<<< HEAD
         if blk.loop_attn_gains is not None:
             blk.loop_attn_gains.zero_()
             blk.loop_ffn_gains.zero_()
             if blk.loop_x0_gains is not None:
                 blk.loop_x0_gains.zero_()
-    return new_model, new_cfg
-=======
 
     rescale = _rescale_map(old_cfg, new_cfg)
     stats = verify_growth_mapping(old_model, new_model, rescale)       # raises GrowthError if anything was lost
@@ -417,7 +415,8 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
         return new_model, new_cfg
     od, nd = old_cfg.to_dict(), new_cfg.to_dict()
     axes = [name for name, grew in (
-        ("depth", new_cfg.n_layer > old_cfg.n_layer), ("ffn", new_cfg.ffn_hidden > old_cfg.ffn_hidden),
+        ("depth", new_cfg.n_layer > old_cfg.n_layer), ("loops", new_cfg.n_loops > old_cfg.n_loops),
+        ("ffn", new_cfg.ffn_hidden > old_cfg.ffn_hidden),
         ("width", new_cfg.n_embd > old_cfg.n_embd or new_cfg.n_head > old_cfg.n_head),
         ("context", new_cfg.block_size > old_cfg.block_size)) if grew]
     report = GrowthReport(
@@ -427,7 +426,6 @@ def grow_model(old_model: TensegrityLM, old_cfg: Optional[TensegrityConfig] = No
         embedded_entries=stats["embedded"], carried_scalars=stats["scalars"], new_only=stats["new_only"],
         max_carry_deviation=stats["max_deviation"])
     return new_model, new_cfg, report
->>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
 
 
 @torch.no_grad()
@@ -462,6 +460,19 @@ def grow_optimizer_state(old_model: nn.Module, old_opt_or_state: Any,
     else:
         return 0
 
+    from .optim import SingleDeviceMuonWithAuxAdam
+    group_of = {id(p): g for g in new_opt.param_groups for p in g["params"]}
+
+    def as_step(value: Any, p: torch.Tensor) -> Any:
+        # the vendored Muon/AdamW keeps an int; torch's AdamW needs a float32 singleton tensor, on the
+        # parameter's device when it is fused/capturable and on the CPU otherwise
+        n = int(value.item()) if isinstance(value, torch.Tensor) else int(value)
+        if isinstance(new_opt, SingleDeviceMuonWithAuxAdam):
+            return n
+        g = group_of.get(id(p), {})
+        on_dev = g.get("fused") or g.get("capturable")
+        return torch.tensor(float(n), dtype=torch.float32, device=p.device if on_dev else "cpu")
+
     count = 0
     for name, np_ in new_model.named_parameters():
         ost = old_by_name.get(name)
@@ -484,8 +495,7 @@ def grow_optimizer_state(old_model: nn.Module, old_opt_or_state: Any,
             eas[sl].copy_(eas_old[sl].to(np_.device, np_.dtype))
             nst["exp_avg"] = ea
             nst["exp_avg_sq"] = eas
-            step_val = ost.get("step", 0)
-            nst["step"] = int(step_val.item()) if isinstance(step_val, torch.Tensor) else int(step_val)
+            nst["step"] = as_step(ost.get("step", 0), np_)
             count += 1
     return count
 

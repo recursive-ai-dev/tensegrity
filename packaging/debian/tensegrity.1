@@ -1,0 +1,87 @@
+.TH TENSEGRITY 1 "" "Tensegrity" "User Commands"
+.SH NAME
+tensegrity \- train, grow and run byte-level language models
+.SH SYNOPSIS
+.B tensegrity
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+Tensegrity is a PyTorch toolkit for byte-level language models from 1M to 115M
+parameters. It provides data preparation and integrity auditing, resumable
+training, generation, evaluation, function-preserving model growth and export.
+Models and corpora are provided separately by the user.
+.SH COMMANDS
+.TP
+.B doctor
+Report runtime dependencies and hardware. Add --smoke to run a small training,
+checkpoint and generation check, or --json for machine-readable output.
+.TP
+.B presets
+List model sizes and default training budgets.
+.TP
+.B prepare
+Prepare a corpus and write a dataset manifest.
+.TP
+.B audit
+Check the integrity of a prepared dataset.
+.TP
+.B preflight
+Check the model, data and runtime before training.
+.TP
+.B train
+Train or resume a model.
+.TP
+.B generate
+Generate text from a checkpoint.
+.TP
+.B eval
+Evaluate a checkpoint on a dataset.
+.TP
+.B grow
+Grow a trained model into a larger model.
+.TP
+.B export
+Export a checkpoint as safetensors.
+.TP
+.B report
+Write a run report.
+.TP
+.B probe
+Measure context reach and retrieval behavior.
+.TP
+.B bench
+Benchmark generation and attention backends.
+.TP
+.B continual
+Compare continual learning strategies.
+.TP
+.B convert-checkpoint
+Convert a checkpoint into the current format. Legacy pickle loading requires
+the explicit --trust-legacy-pickle option and a checkpoint from a trusted source.
+.PP
+Run
+.B tensegrity command --help
+for the options supported by each command.
+.SH EXAMPLES
+.nf
+tensegrity presets
+tensegrity --version
+tensegrity doctor --smoke
+tensegrity prepare --data_path corpus.txt --out_dir data/mine
+tensegrity preflight --preset 1m --data_dir data/mine
+tensegrity train --preset 1m --data_dir data/mine --out_dir runs/1m --hours 1
+tensegrity generate --ckpt runs/1m/ckpt_best.pt --prompt "Hello"
+.fi
+.SH FILES
+.I /usr/share/doc/tensegrity-lm/README.md.gz
+.RS
+Project guide, architecture and research limitations.
+.RE
+.I /usr/share/doc/tensegrity-lm/README.Debian.gz
+.RS
+Installation, dependency and package build information.
+.RE
+.SH NOTES
+The Debian package uses the system Python and distribution-provided PyTorch.
+CUDA support depends on the installed PyTorch build. Training data and runs are
+written only to the paths chosen by the user.

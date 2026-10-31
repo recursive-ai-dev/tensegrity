@@ -14,6 +14,8 @@ vanilla transformer of equal size):
 
 from __future__ import annotations
 
+import math
+from numbers import Integral
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
@@ -175,12 +177,15 @@ class TensegrityLM(nn.Module):
             for i, block in enumerate(self.blocks):
                 if plan[i]:
                     continue
-                need_v0 = need_v0_flag and v0 is None
                 if use_ckpt and i % self.grad_checkpoint_every == 0:
-                    x, homeo, v0 = torch.utils.checkpoint.checkpoint(
-                        block._forward_impl, x, cos, sin, x0_arg, v0, loop_idx, need_v0, use_reentrant=False)
+                    result = torch.utils.checkpoint.checkpoint(
+                        block, x, cos, sin, x0_arg, v0, loop_idx, need_v0_flag, use_reentrant=False)
                 else:
-                    x, homeo, v0 = block._forward_impl(x, cos, sin, x0_arg, v0, loop_idx, need_v0)
+                    result = block(x, cos, sin, x0_arg, v0, loop_idx, need_v0_flag)
+                if need_v0_flag:
+                    x, homeo, v0 = result
+                else:
+                    x, homeo = result
                 total_homeo = total_homeo + homeo
                 n_active += 1
 
@@ -243,21 +248,17 @@ class TensegrityLM(nn.Module):
         B, T = idx.shape
         if not streaming and pos_start + T > self.cfg.block_size:
             raise ValueError(f"positions [{pos_start}, {pos_start + T}) exceed block_size {self.cfg.block_size}")
-<<<<<<< HEAD
-        n_total = len(self.blocks) * self.cfg.n_loops
-=======
         if streaming and T > self.cfg.block_size:
             raise ValueError(f"a streaming step takes at most block_size={self.cfg.block_size} tokens, got {T}")
         max_cache = self.cfg.block_size if streaming else None
->>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
+        n_total = len(self.blocks) * self.cfg.n_loops      # one KV cache per (loop pass, block)
         if past_kv_list is None:
             past_kv_list = [None] * n_total
 
         x0 = self._embed(idx, ctx)
         x = x0
         x0_arg = x0 if self.cfg.x0_mix else None
-<<<<<<< HEAD
-        cos_all, sin_all = self._rope_tables(idx.device)
+        cos_all, sin_all = self._rope_tables(idx.device, pos_start + T)
         cos = cos_all[pos_start:pos_start + T].view(1, 1, T, -1)
         sin = sin_all[pos_start:pos_start + T].view(1, 1, T, -1)
 
@@ -270,19 +271,12 @@ class TensegrityLM(nn.Module):
                 past = past_kv_list[kv_idx]
                 kv_idx += 1
                 if need_v0_flag and v0 is None:
-                    x, kv, v0 = block.forward_incremental(x, cos, sin, x0_arg, past, v0=None, loop_idx=loop_idx, return_v0=True)
+                    x, kv, v0 = block.forward_incremental(x, cos, sin, x0_arg, past, max_cache, v0=None,
+                                                          loop_idx=loop_idx, return_v0=True)
                 else:
-                    x, kv = block.forward_incremental(x, cos, sin, x0_arg, past, v0=v0, loop_idx=loop_idx, return_v0=False)
+                    x, kv = block.forward_incremental(x, cos, sin, x0_arg, past, max_cache, v0=v0,
+                                                      loop_idx=loop_idx, return_v0=False)
                 new_past.append(kv)
-=======
-        cos_all, sin_all = self._rope_tables(idx.device, pos_start + T)
-        cos, sin = cos_all[pos_start:pos_start + T], sin_all[pos_start:pos_start + T]
-
-        new_past: List[KV] = []
-        for block, past in zip(self.blocks, past_kv_list):
-            x, kv = block.forward_incremental(x, cos, sin, x0_arg, past, max_cache)
-            new_past.append(kv)
->>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -378,15 +372,29 @@ class TensegrityLM(nn.Module):
             raise ValueError(f"cache_mode must be 'window' or 'streaming', got {cache_mode!r}")
         if cache_mode == "streaming" and not use_cache:
             raise ValueError("cache_mode='streaming' needs use_cache=True")
-        if temperature < 0.0:
-            raise ValueError(f"temperature must be >= 0, got {temperature}")
-        if top_k is not None and top_k <= 0:
-            raise ValueError(f"top_k must be None or positive, got {top_k}")
-        if idx.dim() != 2 or idx.size(1) < 1:
-            raise ValueError("idx must be (B, T) with T >= 1")
+        if not isinstance(max_new_tokens, Integral) or isinstance(max_new_tokens, bool) or max_new_tokens < 0:
+            raise ValueError(f"max_new_tokens must be a nonnegative integer, got {max_new_tokens}")
+        if not math.isfinite(temperature) or temperature < 0.0:
+            raise ValueError(f"temperature must be finite and >= 0, got {temperature}")
+        if top_k is not None and (not isinstance(top_k, Integral) or isinstance(top_k, bool) or top_k <= 0):
+            raise ValueError(f"top_k must be None or a positive integer, got {top_k}")
+        if top_p is not None and (not math.isfinite(top_p) or not 0.0 < top_p <= 1.0):
+            raise ValueError(f"top_p must be None or in (0, 1], got {top_p}")
+        if min_p is not None and (not math.isfinite(min_p) or not 0.0 <= min_p <= 1.0):
+            raise ValueError(f"min_p must be None or in [0, 1], got {min_p}")
+        if (not math.isfinite(conf_temp_min) or not math.isfinite(conf_temp_max)
+                or not 0.0 < conf_temp_min <= conf_temp_max):
+            raise ValueError("confidence temperatures must be finite with 0 < conf_temp_min <= conf_temp_max")
+        if idx.dim() != 2 or idx.size(0) < 1 or idx.size(1) < 1:
+            raise ValueError("idx must be (B, T) with B >= 1 and T >= 1")
+        if idx.dtype not in (torch.int32, torch.int64):
+            raise ValueError("idx must contain integer token IDs (torch.int32 or torch.int64)")
         bs = self.cfg.block_size
-        if not 1 <= rebuild_stride <= bs:
+        if (not isinstance(rebuild_stride, Integral) or isinstance(rebuild_stride, bool)
+                or not 1 <= rebuild_stride <= bs):
             raise ValueError(f"rebuild_stride must be in [1, block_size={bs}], got {rebuild_stride}")
+        if max_new_tokens == 0:
+            return
         K = self.cfg.byte_mix_kernel
         if cache_mode == "streaming":
             yield from self._generate_stream_iter(idx, max_new_tokens, temperature, top_k, top_p, min_p,
@@ -483,7 +491,7 @@ class TensegrityLM(nn.Module):
     def stream(self, idx: torch.Tensor, max_new_tokens: int, **kwargs) -> Iterator[Tuple[int, Optional[float]]]:
         """Yield ``(token_id, confidence)`` one byte at a time for a single sequence (B == 1).
         Accepts the sampling kwargs of :meth:`generate`."""
-        if idx.size(0) != 1:
+        if idx.dim() != 2 or idx.size(0) != 1:
             raise ValueError("stream() supports a single sequence (batch size 1)")
         kw = dict(temperature=1.0, top_k=None, top_p=None, min_p=None, use_confidence_temp=False,
                   conf_temp_min=0.5, conf_temp_max=1.5, stop_on_eos=True, use_cache=True, rebuild_stride=1,
@@ -492,11 +500,15 @@ class TensegrityLM(nn.Module):
         if unknown:
             raise TypeError(f"stream() got unexpected keyword argument(s) {sorted(unknown)}")
         kw.update(kwargs)
-        for next_tok, conf in self._generate_iter(idx, max_new_tokens, **kw):
-            tid = int(next_tok[0, 0])
-            yield tid, (float(conf[0]) if conf is not None else None)
-            if kw["stop_on_eos"] and tid == ByteTokenizer.EOS:
-                return
+        iterator = self._generate_iter(idx, max_new_tokens, **kw)
+        try:
+            for next_tok, conf in iterator:
+                tid = int(next_tok[0, 0])
+                yield tid, (float(conf[0]) if conf is not None else None)
+                if kw["stop_on_eos"] and tid == ByteTokenizer.EOS:
+                    return
+        finally:
+            iterator.close()
 
     # --------------------------------------------------------------- optimizer
     def configure_optimizer(self, weight_decay: float, learning_rate: float,

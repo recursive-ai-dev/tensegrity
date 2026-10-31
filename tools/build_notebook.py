@@ -24,7 +24,7 @@ sys.path.insert(0, ROOT)
 OUT = os.path.join(ROOT, "notebooks", "Tensegrity_Colab.ipynb")
 MODULE_ORDER = ["config", "tokenizer", "layers", "model", "optim", "manifest", "ingest", "data", "checkpoint", "hw",
                 "schedule", "evaluation", "growth", "continual", "train", "presets", "ladder", "workflow", "analysis",
-                "export", "perf", "viz", "colab", "report", "cli", "__init__", "__main__"]
+                "export", "perf", "viz", "colab", "report", "diagnostics", "cli", "__init__", "__main__"]
 
 
 def _cell_id(kind: str, key: str) -> str:

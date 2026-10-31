@@ -361,9 +361,12 @@ def test_cli_prepare_and_audit(tmp_path, capsys):
     with pytest.raises(SystemExit) as e:
         main(["audit", "--data_dir", out])
     assert e.value.code == 1
-    with pytest.raises(FileExistsError):
+    with pytest.raises(SystemExit) as e:
         main(["prepare", "--data_path", write_corpus(tmp_path / "d.txt", make_docs(300, seed=9)), "--out_dir", out,
               "--doc_sep", SEP])
+    assert e.value.code == 1
+    error = capsys.readouterr().err
+    assert "immutable" in error and "overwrite" in error and out in error
 
 
 def test_generation_starts_from_the_token_the_data_contains():

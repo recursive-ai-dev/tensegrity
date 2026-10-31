@@ -252,12 +252,8 @@ class CausalSelfAttention(nn.Module):
         return apply_rope(q, cos, sin), apply_rope(k, cos, sin), v, v_raw
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-<<<<<<< HEAD
-                past: Optional[KV] = None, return_kv: bool = False,
+                past: Optional[KV] = None, return_kv: bool = False, max_cache: Optional[int] = None,
                 v0: Optional[torch.Tensor] = None, return_v0: bool = False):
-=======
-                past: Optional[KV] = None, return_kv: bool = False, max_cache: Optional[int] = None):
->>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
         """
         Training / prefill (``past is None``): full-sequence attention starting at position 0.
         Decode (``past`` given): ``x`` must be ONE new token; its K/V are appended to ``past``.
@@ -382,13 +378,12 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                 x0: Optional[torch.Tensor] = None, v0: Optional[torch.Tensor] = None,
-                loop_idx: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-        x, homeo, _ = self._forward_impl(x, cos, sin, x0, v0, loop_idx, need_v0=False)
-        return x, homeo
+                loop_idx: int = 0, return_v0: bool = False):
+        x, homeo, v0_out = self._forward_impl(x, cos, sin, x0, v0, loop_idx, need_v0=return_v0 and v0 is None)
+        return (x, homeo, v0_out) if return_v0 else (x, homeo)
 
     def forward_incremental(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-<<<<<<< HEAD
-                            x0: Optional[torch.Tensor], past: Optional[KV],
+                            x0: Optional[torch.Tensor], past: Optional[KV], max_cache: Optional[int] = None,
                             v0: Optional[torch.Tensor] = None, loop_idx: int = 0,
                             return_v0: bool = False):
         """KV-cached forward for inference (eval mode; no LayerDrop, no homeostasis loss)."""
@@ -396,24 +391,14 @@ class Block(nn.Module):
         if xg is not None and x0 is not None:
             x = x + xg * x0
         if return_v0:
-            attn_out, kv, v0_out = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, v0=v0, return_v0=True)
+            attn_out, kv, v0_out = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, max_cache=max_cache,
+                                             v0=v0, return_v0=True)
         else:
-            attn_out, kv = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, v0=v0)
+            attn_out, kv = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, max_cache=max_cache, v0=v0)
             v0_out = v0
         x = x + ag * attn_out
         x = x + fg * self.ffn(self.ln2(x))
         return (x, kv, v0_out) if return_v0 else (x, kv)
-=======
-                            x0: Optional[torch.Tensor], past: Optional[KV], max_cache: Optional[int] = None
-                            ) -> Tuple[torch.Tensor, KV]:
-        """KV-cached forward for inference (eval mode; no LayerDrop, no homeostasis loss)."""
-        if self.x0_gain is not None:
-            x = x + self.x0_gain * x0
-        attn_out, kv = self.attn(self.ln1(x), cos, sin, past=past, return_kv=True, max_cache=max_cache)
-        x = x + self.attn_gain * attn_out
-        x = x + self.ffn_gain * self.ffn(self.ln2(x))
-        return x, kv
->>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
 
 
 class ByteMix(nn.Module):

@@ -173,11 +173,7 @@ def climb_ladder(rungs: Sequence[str], data_dirs, root: str, *, hours=None, toke
 
         lineage = {"grown_from": file_record(os.path.join(prev_dir, "ckpt_best.pt")), "rung": i} if i > 0 else {"rung": 0}
         trainer = Trainer(model, tc, plan, data_dirs, run_dir, data_weights=data_weights, device=dev,
-<<<<<<< HEAD
-                          callbacks=callbacks, init_optimizer=init_opt_fn)
-=======
-                          callbacks=callbacks, lineage=lineage)
->>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
+                          callbacks=callbacks, lineage=lineage, init_optimizer=init_opt_fn)
         res = trainer.fit(resume=True)
         r = RungResult(rung=name, params=cfg.n_params(), status=res["status"], steps=res["step"],
                        tokens_seen=res["tokens_seen"], best_val_loss=res["best_val_loss"],

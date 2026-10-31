@@ -72,8 +72,14 @@ def read_meta(data_dir: str) -> Dict[str, Any]:
     path = os.path.join(data_dir, "meta.json")
     if not os.path.exists(path):
         raise DatasetError(f"{data_dir} has no meta.json; it was not produced by prepare_data()")
-    with open(path) as fh:
-        return json.load(fh)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise DatasetError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(meta, dict):
+        raise DatasetError(f"{path} must contain a JSON object")
+    return meta
 
 
 def has_manifest(meta: Dict[str, Any]) -> bool:
@@ -86,8 +92,8 @@ def _quick_hash(path: str) -> str:
     h.update(str(size).encode())
     with open(path, "rb") as fh:
         h.update(fh.read(_QUICK_EDGE))
-        if size > 2 * _QUICK_EDGE:
-            fh.seek(size - _QUICK_EDGE)
+        if size > _QUICK_EDGE:
+            fh.seek(max(_QUICK_EDGE, size - _QUICK_EDGE))
             h.update(fh.read(_QUICK_EDGE))
     return h.hexdigest()
 
@@ -119,23 +125,53 @@ def verify_dataset(data_dir: str, deep: bool = False) -> List[str]:
             problems.append(f"{name} has an odd byte size ({os.path.getsize(p)}); not a uint16 stream")
     if problems:
         return problems
+    if not os.path.exists(os.path.join(data_dir, "meta.json")):
+        return problems          # legacy / hand-made directory: nothing to compare against
     try:
         meta = read_meta(data_dir)
-    except DatasetError:
-        return problems          # legacy / hand-made directory: nothing to compare against
-    if not has_manifest(meta):
+    except DatasetError as exc:
+        return [str(exc)]
+    if not any(k in meta for k in ("manifest_version", "fingerprint", "files")):
         for key, name in (("n_train_tokens", "train.bin"), ("n_val_tokens", "val.bin")):
+            if key in meta and (not isinstance(meta[key], int) or isinstance(meta[key], bool) or meta[key] < 0):
+                problems.append(f"meta.json: {key} must be a non-negative integer")
+                continue
             if key in meta and meta[key] * 2 != os.path.getsize(os.path.join(data_dir, name)):
                 problems.append(f"{name} holds {os.path.getsize(os.path.join(data_dir, name)) // 2:,} tokens but "
                                 f"meta.json says {meta[key]:,}")
         return problems
-    for name, rec in meta["files"].items():
+    # Reject malformed manifests before using their file names or indexing fields.
+    # A manifest never grants permission to read arbitrary paths outside its directory.
+    try:
+        if meta["manifest_version"] != MANIFEST_VERSION:
+            raise ValueError(f"unsupported manifest_version {meta['manifest_version']!r}")
+        if set(meta["files"]) != set(SPLIT_FILES):
+            raise ValueError("files must describe exactly train.bin and val.bin")
+        for name in SPLIT_FILES:
+            rec = meta["files"][name]
+            if not isinstance(rec["bytes"], int) or isinstance(rec["bytes"], bool) or rec["bytes"] < 0:
+                raise ValueError(f"{name}: bytes must be a non-negative integer")
+            if (not isinstance(rec["sha256"], str) or len(rec["sha256"]) != 64
+                    or any(c not in "0123456789abcdef" for c in rec["sha256"])):
+                raise ValueError(f"{name}: sha256 must be a 64-character lowercase hex digest")
+        for key in ("n_train_tokens", "n_val_tokens", "n_train_documents", "n_val_documents"):
+            value = meta["counts"][key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{key} must be a non-negative integer")
+        for key, name in (("n_train_tokens", "train.bin"), ("n_val_tokens", "val.bin")):
+            if meta["counts"][key] * 2 != meta["files"][name]["bytes"]:
+                problems.append(f"{key} disagrees with {name} byte count")
+        fingerprint = compute_fingerprint(meta)
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        return [f"invalid dataset manifest: {exc}"]
+    for name in SPLIT_FILES:
+        rec = meta["files"][name]
         p = os.path.join(data_dir, name)
         if os.path.getsize(p) != rec["bytes"]:
             problems.append(f"{name}: {os.path.getsize(p):,} bytes on disk, manifest says {rec['bytes']:,}")
         elif deep and sha256_file(p) != rec["sha256"]:
             problems.append(f"{name}: content hash differs from the manifest (file was modified after prepare)")
-    if compute_fingerprint(meta) != meta["fingerprint"]:      # O(1): the manifest must agree with itself
+    if fingerprint != meta.get("fingerprint"):      # O(1): the manifest must agree with itself
         problems.append("manifest fingerprint does not match its own contents (meta.json was edited)")
     return problems
 
@@ -144,10 +180,8 @@ def data_identity(data_dir: str) -> Dict[str, Any]:
     """``{"fingerprint", "kind", "n_train_tokens", "n_val_tokens"}`` for a prepared directory.
     ``kind`` is ``"manifest"`` (hash recorded at prepare time) or ``"quick"`` (derived, legacy dirs)."""
     meta: Dict[str, Any] = {}
-    try:
+    if os.path.exists(os.path.join(data_dir, "meta.json")):
         meta = read_meta(data_dir)
-    except DatasetError:
-        pass
     if has_manifest(meta):
         fp, kind = meta["fingerprint"], "manifest"
     else:

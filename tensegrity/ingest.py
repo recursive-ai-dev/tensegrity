@@ -35,7 +35,9 @@ import random
 import re
 import shutil
 import string
+import tempfile
 import time
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -551,7 +553,31 @@ def _write_document_split(stream: np.ndarray, index: _DocIndex, keep: Optional[n
 # prepare
 # =============================================================================
 
+@contextmanager
+def _publish_lock(out_dir: str):
+    """Fail without touching data when another process is publishing this directory.
+
+    The lock directory is deliberately independent of the staging directory and output
+    contents. It is held only for publication; expensive ingestion can run concurrently.
+    """
+    lock = out_dir + ".prepare-lock"
+    try:
+        os.mkdir(lock)
+    except FileExistsError:
+        raise M.DatasetError(f"another preparation is publishing {out_dir}; retry after it completes. "
+                             f"If a preparation crashed, remove its stale lock directory {lock}.") from None
+    try:
+        yield
+    finally:
+        os.rmdir(lock)
+
+
 def _publish(staging: str, out_dir: str, files: Sequence[str], fingerprint: str, overwrite: bool, say) -> str:
+    with _publish_lock(out_dir):
+        return _publish_unlocked(staging, out_dir, files, fingerprint, overwrite, say)
+
+
+def _publish_unlocked(staging: str, out_dir: str, files: Sequence[str], fingerprint: str, overwrite: bool, say) -> str:
     """Move the staged files into ``out_dir``. Returns "published" | "unchanged" | "replaced"."""
     os.makedirs(out_dir, exist_ok=True)
     existing = [f for f in ("meta.json", "train.bin", "val.bin") if os.path.exists(os.path.join(out_dir, f))]
@@ -562,7 +588,7 @@ def _publish(staging: str, out_dir: str, files: Sequence[str], fingerprint: str,
             old_fp = M.read_meta(out_dir).get("fingerprint")
         except (M.DatasetError, ValueError):
             pass
-        if old_fp == fingerprint:
+        if old_fp == fingerprint and not M.verify_dataset(out_dir, deep=True):
             shutil.rmtree(staging, ignore_errors=True)
             say(f"[prepare] {out_dir} already holds this exact dataset ({fingerprint[:23]}...); left untouched")
             return "unchanged"
@@ -571,9 +597,8 @@ def _publish(staging: str, out_dir: str, files: Sequence[str], fingerprint: str,
             raise FileExistsError(
                 f"{out_dir} already contains a different prepared dataset ({old_fp or 'no fingerprint'} vs the new "
                 f"{fingerprint}). Prepared datasets are immutable: write to a new directory, or pass "
-                f"overwrite=True to move the old files aside to '{out_dir}.replaced-<time>' and replace them.")
-        aside = f"{out_dir}.replaced-{int(time.time())}"
-        os.makedirs(aside, exist_ok=True)
+                f"overwrite=True to move the old files aside to '{out_dir}.replaced-<unique-id>' and replace them.")
+        aside = tempfile.mkdtemp(prefix=os.path.basename(out_dir) + ".replaced-", dir=os.path.dirname(out_dir))
         for f in existing:                       # meta.json first: a crash mid-way leaves "not a dataset", not a mismatch
             os.replace(os.path.join(out_dir, f), os.path.join(aside, f))
         say(f"[prepare] previous dataset moved to {aside}")
@@ -631,6 +656,10 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
         raise ValueError("dedup needs a document-level split (split='document' or 'auto')")
     if not 0.0 <= max_reject_fraction <= 1.0:
         raise ValueError("max_reject_fraction must be in [0, 1]")
+    if not isinstance(chunk_bytes, int) or isinstance(chunk_bytes, bool) or chunk_bytes < 1:
+        raise ValueError("chunk_bytes must be a positive integer")
+    if max_bytes is not None and (not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1):
+        raise ValueError("max_bytes must be a positive integer or None")
     if text_field is not None and text_column not in ("auto", None, text_field):
         raise ValueError("pass text_field or text_column, not two different values")
     spec = _RecordSpec(text_field if text_field is not None else text_column, record_template, group_field)
@@ -647,9 +676,8 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
         random.Random(seed).shuffle(files)
 
     out_dir = os.path.abspath(out_dir)
-    staging = out_dir + ".staging"
-    shutil.rmtree(staging, ignore_errors=True)
-    os.makedirs(staging)
+    os.makedirs(os.path.dirname(out_dir), exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=os.path.basename(out_dir) + ".staging-", dir=os.path.dirname(out_dir))
 
     sep = doc_sep.encode("utf-8") if doc_sep else None
     salt = f"tensegrity-split/{seed}".encode()

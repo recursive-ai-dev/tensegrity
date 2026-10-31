@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+case "$1" in
+    remove|upgrade|deconfigure)
+        if command -v py3clean >/dev/null 2>&1; then
+            if [ -n "${DPKG_ROOT:-}" ]; then
+                py3clean "$DPKG_ROOT/usr/lib/python3/dist-packages/tensegrity"
+            else
+                py3clean -p tensegrity-lm
+            fi
+        fi
+        ;;
+esac
+exit 0

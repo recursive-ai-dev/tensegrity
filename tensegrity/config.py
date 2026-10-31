@@ -82,6 +82,32 @@ class TensegrityConfig:
 
     # --------------------------------------------------------------- validate
     def __post_init__(self) -> None:
+        # Validate before arithmetic so malformed JSON configs fail here, rather than
+        # in an allocation, modulo-by-zero, or a non-finite training step later.
+        for name in ("vocab_size", "block_size", "n_layer", "n_embd", "n_head", "n_kv_head",
+                     "sliding_window", "global_every", "ffn_align", "grad_checkpoint_every", "n_loops"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if not isinstance(self.byte_mix_kernel, int) or isinstance(self.byte_mix_kernel, bool):
+            raise ValueError(f"byte_mix_kernel must be an integer, got {self.byte_mix_kernel!r}")
+        for name in ("dropout", "rope_base", "ffn_mult", "homeo_target", "homeo_weight", "layerdrop_max",
+                     "confidence_weight", "init_std", "z_loss_weight", "norm_eps", "gain_init", "logit_soft_cap"):
+            value = getattr(self, name)
+            if value is None and name in ("gain_init", "logit_soft_cap"):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number, got {value!r}")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+        for name in ("rope_base", "ffn_mult"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be > 0, got {getattr(self, name)}")
+        if self.logit_soft_cap is not None and self.logit_soft_cap <= 0:
+            raise ValueError(f"logit_soft_cap must be > 0 or None, got {self.logit_soft_cap}")
+        for name in ("homeo_target", "init_std", "homeo_weight", "confidence_weight", "z_loss_weight"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         if self.n_embd % self.n_head != 0:
             raise ValueError(f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})")
         if (self.n_embd // self.n_head) % 2 != 0:
@@ -168,14 +194,14 @@ class TensegrityConfig:
         With at least one global layer a byte can read any earlier byte directly, so this is
         ``block_size``. With none, information can only hop ``sliding_window - 1`` positions per local
         layer, and ByteMix adds ``byte_mix_kernel - 1`` at the input:
-        ``1 + n_layer * (sliding_window - 1) + (byte_mix_kernel - 1)`` (e.g. 4 local layers of window
+        ``1 + n_layer * n_loops * (sliding_window - 1) + (byte_mix_kernel - 1)`` (e.g. 4 local layers of window
         124 see at most 493 bytes of a 1024-byte context), capped at ``block_size``. This is an upper
         bound on what the architecture allows, not a measurement of what a trained model uses --
         see :func:`tensegrity.evaluation.context_probe` for that."""
         if self.n_global_layers:
             return self.block_size
         mix = max(0, self.byte_mix_kernel - 1)
-        return min(self.block_size, 1 + self.n_layer * (self.sliding_window - 1) + mix)
+        return min(self.block_size, 1 + self.n_layer * self.n_loops * (self.sliding_window - 1) + mix)
 
     def n_params(self) -> int:
         """Exact parameter count (tied embedding counted once). Verified against a real
@@ -228,13 +254,9 @@ class TensegrityConfig:
     def describe(self) -> str:
         n = self.n_params()
         kinds = "".join("G" if self.is_global_layer(i) else "l" for i in range(self.n_layer))
-<<<<<<< HEAD
         loops = f"x{self.n_loops}" if self.n_loops > 1 else ""
-        return (f"{n / 1e6:.2f}M params | L={self.n_layer}{loops} d={self.n_embd} "
-=======
         rf = self.receptive_field()
         reach = f"reach={rf}" + ("" if rf == self.block_size else f" (LOCAL-ONLY: sees at most {rf} of {self.block_size} bytes)")
-        return (f"{n / 1e6:.2f}M params | L={self.n_layer} d={self.n_embd} "
->>>>>>> 2ce839cc872fad399fe0c8bb31dc531bcfdf000b
+        return (f"{n / 1e6:.2f}M params | L={self.n_layer}{loops} d={self.n_embd} "
                 f"heads={self.n_head}/{self.n_kv_head}kv (hd={self.head_dim}) ffn={self.ffn_hidden} "
                 f"ctx={self.block_size} win={self.sliding_window} layers[{kinds}] {reach}")
