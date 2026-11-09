@@ -1,4 +1,4 @@
-include README.md pytest.ini
+include README.md LICENSE pytest.ini
 recursive-include tensegrity *.py
 recursive-include packaging *
 recursive-include tools *.py *.md *.log

@@ -7,6 +7,7 @@ name = "tensegrity-lm"
 version = "2.2.0"
 description = "Byte-level language models from 1M to 115M parameters with a verified, trainable growth ladder"
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = ["torch>=2.3", "numpy>=1.23", "safetensors>=0.4"]
 

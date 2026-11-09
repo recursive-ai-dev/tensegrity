@@ -322,4 +322,4 @@ python tools/build_notebook.py --check    # CI: the committed notebook must equa
 * Byte-level modelling costs ~4× the sequence length of a subword model for the same text.
 * The GPU-only code paths (fp16 loss scaling on a T4, native GQA on Ampere+, fused AdamW, `torch.compile`) were written against the documented behaviour but could not be exercised in the CPU-only environment this release was built in. `preflight` runs real optimizer steps on your device before every new run and the notebook falls back to AdamW if Muon misbehaves; please report anything that surprises you.
 * Hyper-parameter defaults per size are scaling heuristics plus the small ablations above, not per-size sweeps.
-* No licence file is included; add one before redistributing.
+* Released under the MIT License (see [LICENSE](LICENSE)).
