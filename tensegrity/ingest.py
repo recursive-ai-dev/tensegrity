@@ -20,8 +20,9 @@ The contract (the reason this module exists):
   never leaves a half-written dataset, and an existing *different* dataset is never overwritten
   without ``overwrite=True`` (the old files are moved aside, not deleted).
 
-On-disk format is unchanged from v1/v2: ``train.bin`` / ``val.bin`` are flat ``uint16`` streams
-(bytes 0-255, EOS = 257 after every document). Existing prepared directories keep working.
+On-disk format: ``train.bin`` / ``val.bin`` are flat ``uint16`` streams (bytes 0-255, EOS = 257 after
+every document). For ChatML format, parallel ``train.mask`` / ``val.mask`` (uint8) files provide
+assistant-only loss masks. Existing prepared directories keep working.
 """
 
 from __future__ import annotations
@@ -46,13 +47,14 @@ from . import manifest as M
 from .tokenizer import ByteTokenizer
 
 SUPPORTED_EXTS = {".txt": "text", ".md": "text", ".jsonl": "jsonl", ".parquet": "parquet"}
-FORMATS = ("text", "jsonl", "parquet")
+FORMATS = ("text", "jsonl", "parquet", "chatml")
 _TEXT_KEYS = ("text", "content", "body", "story")
 _EOS = ByteTokenizer.EOS
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _U64 = float(2 ** 64)
 
 Record = Tuple[bytes, Optional[bytes]]       # (document bytes, optional split-group key)
+MaskRecord = Tuple[List[int], List[int]]     # (tokens, loss_mask) for chatml
 
 
 # =============================================================================
@@ -122,8 +124,9 @@ class _StreamEncoder:
     hashes: of its content and of its split key (the content, unless a record supplied a group key
     through :meth:`begin_record`). ``salt`` makes the split seed-dependent."""
 
-    def __init__(self, sink, sep: Optional[bytes] = None, index: Optional[_DocIndex] = None, salt: bytes = b""):
+    def __init__(self, sink, mask_sink: Optional[Callable[[np.ndarray], None]] = None, sep: Optional[bytes] = None, index: Optional[_DocIndex] = None, salt: bytes = b""):
         self.sink = sink
+        self.mask_sink = mask_sink
         self.sep = sep or None
         self._rx = re.compile(re.escape(self.sep)) if self.sep else None
         self.carry = b""
@@ -156,19 +159,21 @@ class _StreamEncoder:
                 self._hasher = hashlib.blake2b(self._salt, digest_size=8)
             self._hasher.update(arr[prev:].tobytes())
 
-    def _emit(self, arr: np.ndarray) -> None:
+    def _emit(self, arr: np.ndarray, mask: Optional[np.ndarray] = None) -> None:
         if arr.size:
             if self.index is not None:
                 self._track(arr)
             self.n_tokens += int(arr.size)
             self.sink(arr)
+            if self.mask_sink is not None and mask is not None:
+                self.mask_sink(mask)
 
-    def _encode(self, data: bytes) -> None:
+    def _encode(self, data: bytes, mask: Optional[np.ndarray] = None) -> None:
         if not data:
             return
         arr = np.frombuffer(data, dtype=np.uint8).astype(np.uint16)
         if self._rx is None:
-            self._emit(arr)
+            self._emit(arr, mask)
             return
         pos = np.fromiter((m.start() for m in self._rx.finditer(data)), dtype=np.int64)
         if pos.size:
@@ -178,10 +183,12 @@ class _StreamEncoder:
                 for off in range(1, len(self.sep)):
                     keep[pos + off] = False
                 arr = arr[keep]
+                if mask is not None:
+                    mask = mask[keep]
             self.n_docs += int(pos.size)
-        self._emit(arr)
+        self._emit(arr, mask)
 
-    def feed(self, raw: bytes) -> None:
+    def feed(self, raw: bytes, mask: Optional[np.ndarray] = None) -> None:
         data = self.carry + raw
         self.carry = b""
         if self._rx is not None:
@@ -191,14 +198,16 @@ class _StreamEncoder:
             hold = _partial_suffix_len(data[last_end:], self.sep)
             if hold:
                 self.carry, data = data[-hold:], data[:-hold]
-        self._encode(data)
+        self._encode(data, mask)
 
-    def end_document(self) -> None:
+    def end_document(self, mask: Optional[np.ndarray] = None) -> None:
         """Flush any held partial separator as ordinary bytes, then emit one EOS."""
         if self.carry:
             tail, self.carry = self.carry, b""
             self._encode(tail)
-        self._emit(np.array([_EOS], dtype=np.uint16))
+        eos_arr = np.array([_EOS], dtype=np.uint16)
+        eos_mask = np.array([1], dtype=np.uint8) if mask is not None else None
+        self._emit(eos_arr, eos_mask)
         self.n_docs += 1
         self._group = None
 
@@ -351,6 +360,60 @@ def _iter_jsonl_records(path: str, spec: _RecordSpec, rej: _Rejects) -> Iterator
             yield rec
 
 
+def _iter_chatml_records(path: str, rej: _Rejects) -> Iterator[MaskRecord]:
+    """Iterate ChatML JSONL records: {"messages": [{"role": "...", "content": "..."}, ...]}."""
+    tok = ByteTokenizer()
+    with open(path, "rb") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            rej.seen()
+            try:
+                line = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                rej.add(path, "invalid_utf8", f"line {lineno}")
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                rej.add(path, "invalid_json", f"line {lineno}: {line[:80]}")
+                continue
+            if not isinstance(obj, dict):
+                rej.add(path, "not_an_object", f"line {lineno}: {type(obj).__name__}")
+                continue
+            messages = obj.get("messages")
+            if not isinstance(messages, list) or not messages:
+                rej.add(path, "no_messages", f"line {lineno}: missing or empty 'messages' list")
+                continue
+            # Validate each message
+            has_assistant = False
+            for i, msg in enumerate(messages):
+                if not isinstance(msg, dict):
+                    rej.add(path, "invalid_message", f"line {lineno}: message {i} not an object")
+                    break
+                role = msg.get("role")
+                content = msg.get("content")
+                if role not in ("system", "user", "assistant", "tool"):
+                    rej.add(path, "invalid_role", f"line {lineno}: message {i} invalid role {role!r}")
+                    break
+                if not isinstance(content, str) or not content:
+                    rej.add(path, "empty_content", f"line {lineno}: message {i} empty content")
+                    break
+                if role == "assistant":
+                    has_assistant = True
+            else:
+                if not has_assistant:
+                    rej.add(path, "no_assistant_turn", f"line {lineno}: at least one assistant turn required")
+                    continue
+                # Valid conversation - encode with mask
+                tokens, mask = tok.encode_chat_with_mask(messages)
+                yield (tokens, mask)
+                continue
+            # If we broke out of the loop, skip this record
+            continue
+
+
 def _pick_text_column(names: Sequence[str], string_cols: Sequence[str], requested: str, path: str) -> str:
     if requested != "auto":
         if requested not in names:
@@ -442,12 +505,12 @@ def list_source_files(data_path: str, format: Optional[str] = None) -> List[str]
             found = sorted({os.path.splitext(f)[1].lower() or "(no extension)" for f in allf})
             raise ValueError(f"no ingestible files under {data_path}: supported extensions are "
                              f"{sorted(SUPPORTED_EXTS)}; found {found or 'no files'}. "
-                             f"Pass format='text'|'jsonl'|'parquet' to read other files explicitly.")
+                             f"Pass format='text'|'jsonl'|'parquet'|'chatml' to read other files explicitly.")
         return files
     if os.path.isfile(data_path):
         if format is None and os.path.splitext(data_path)[1].lower() not in SUPPORTED_EXTS:
             raise ValueError(f"{data_path}: unrecognised extension {os.path.splitext(data_path)[1]!r} "
-                             f"(supported: {sorted(SUPPORTED_EXTS)}). Pass format='text'|'jsonl'|'parquet' "
+                             f"(supported: {sorted(SUPPORTED_EXTS)}). Pass format='text'|'jsonl'|'parquet'|'chatml' "
                              f"to say how it should be read.")
         return [data_path]
     raise FileNotFoundError(f"{data_path} does not exist")
@@ -489,7 +552,38 @@ class _HashingSink:
         return self._sha.hexdigest()
 
 
+class _MaskSink:
+    """Writes uint8 mask arrays to a file while hashing them."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fh = open(path, "wb")
+        self._sha = hashlib.sha256()
+        self.n_tokens = 0
+
+    def write(self, arr: np.ndarray) -> None:
+        arr = np.ascontiguousarray(arr, dtype=np.uint8)
+        mv = memoryview(arr).cast("B")
+        self._fh.write(mv)
+        self._sha.update(mv)
+        self.n_tokens += int(arr.size)
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            self._fh.close()
+
+    def digest(self) -> str:
+        return self._sha.hexdigest()
+
+
 def _copy_range(stream: np.ndarray, a: int, b: int, sink: _HashingSink, block: int = 1 << 24) -> None:
+    for s in range(a, b, block):
+        sink.write(stream[s: min(b, s + block)])
+
+
+def _copy_range_mask(stream: np.ndarray, a: int, b: int, sink: _MaskSink, block: int = 1 << 24) -> None:
     for s in range(a, b, block):
         sink.write(stream[s: min(b, s + block)])
 
@@ -549,6 +643,25 @@ def _write_document_split(stream: np.ndarray, index: _DocIndex, keep: Optional[n
                 _copy_range(stream, int(starts[lo]), int(ends[hi - 1]), val if a else train)
 
 
+def _write_document_split_mask(stream: np.ndarray, index: _DocIndex, keep: Optional[np.ndarray], val_fraction: float,
+                               train: _MaskSink, val: _MaskSink) -> None:
+    prev, off = 0, 0
+    for chunk in index.chunks():
+        starts, ends = _doc_bounds(chunk, prev)
+        prev = int(ends[-1])
+        assign = ((chunk["split"].astype(np.float64) / _U64) < val_fraction).astype(np.int8)
+        if keep is not None:
+            assign = np.where(keep[off: off + len(chunk)], assign, np.int8(-1))
+        off += len(chunk)
+        change = np.flatnonzero(np.diff(assign)) + 1
+        run_lo = np.concatenate(([0], change))
+        run_hi = np.concatenate((change, [len(assign)]))
+        for lo, hi in zip(run_lo.tolist(), run_hi.tolist()):
+            a = int(assign[lo])
+            if a >= 0:
+                _copy_range_mask(stream, int(starts[lo]), int(ends[hi - 1]), val if a else train)
+
+
 # =============================================================================
 # prepare
 # =============================================================================
@@ -580,7 +693,7 @@ def _publish(staging: str, out_dir: str, files: Sequence[str], fingerprint: str,
 def _publish_unlocked(staging: str, out_dir: str, files: Sequence[str], fingerprint: str, overwrite: bool, say) -> str:
     """Move the staged files into ``out_dir``. Returns "published" | "unchanged" | "replaced"."""
     os.makedirs(out_dir, exist_ok=True)
-    existing = [f for f in ("meta.json", "train.bin", "val.bin") if os.path.exists(os.path.join(out_dir, f))]
+    existing = [f for f in ("meta.json", "train.bin", "val.bin", "train.mask", "val.mask") if os.path.exists(os.path.join(out_dir, f))]
     status = "published"
     if existing:
         old_fp = None
@@ -619,7 +732,7 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
                  validate_utf8: bool = True, max_reject_fraction: float = 0.01,
                  overwrite: bool = False, hash_sources: bool = True) -> Dict[str, Any]:
     """
-    Turn text / markdown / jsonl / parquet file(s) into ``out_dir/{train,val}.bin`` plus a manifest.
+    Turn text / markdown / jsonl / parquet / chatml file(s) into ``out_dir/{train,val}.bin`` plus a manifest.
 
     Documents
       * ``.txt`` / ``.md``: one document per file, or one per ``doc_sep`` occurrence (a literal such as
@@ -629,6 +742,9 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
         such as ``"Q: {question}\\nContext: {context}\\nA: {answer}"`` which stitches several fields
         into one record. Records that lack the field are rejected and counted; more than
         ``max_reject_fraction`` of a file's records being rejected is an error.
+      * ``.jsonl`` with ``format="chatml"``: each line is a JSON object with a ``messages`` field
+        containing a list of {"role": "system"|"user"|"assistant"|"tool", "content": "..."} turns.
+        Produces parallel ``train.mask`` / ``val.mask`` (uint8) for assistant-only loss.
       * ``format`` forces a reader for files whose extension is not recognised.
 
     Splitting (``split``)
@@ -682,14 +798,19 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
     sep = doc_sep.encode("utf-8") if doc_sep else None
     salt = f"tensegrity-split/{seed}".encode()
     stream_path = os.path.join(staging, "stream.tmp")
+    mask_path = os.path.join(staging, "mask.tmp")
     index = _DocIndex(os.path.join(staging, "docs.idx"))
     rej = _Rejects()
     sources: List[Dict[str, Any]] = []
     n_src = 0
     t0 = time.time()
+    has_mask = False
     try:
-        with open(stream_path, "wb") as sink_f:
-            enc = _StreamEncoder(lambda a: a.tofile(sink_f), sep, index, salt)
+        with open(stream_path, "wb") as sink_f, open(mask_path, "wb") as mask_f:
+            def mask_sink(arr: np.ndarray) -> None:
+                arr.tofile(mask_f)
+
+            enc = _StreamEncoder(lambda a: a.tofile(sink_f), mask_sink, sep, index, salt)
             budget = max_bytes
             for f in files:
                 if budget is not None and n_src >= budget:
@@ -698,7 +819,23 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
                 src_rec: Dict[str, Any] = {"path": os.path.abspath(f), "name": os.path.basename(f), "format": fmt}
                 snap = rej.snapshot()
                 n_before = n_src
-                if fmt in ("jsonl", "parquet"):
+                if fmt == "chatml":
+                    has_mask = True
+                    n_rec = 0
+                    for tokens, mask in _iter_chatml_records(f, rej):
+                        if budget is not None and n_src >= budget:
+                            break
+                        # For chatml, each record is a full conversation (one document)
+                        # We encode tokens and mask directly
+                        arr = np.array(tokens, dtype=np.uint16)
+                        mask_arr = np.array(mask, dtype=np.uint8)
+                        enc._emit(arr, mask_arr)
+                        n_src += len(tokens)
+                        n_rec += 1
+                    rej.check_since(snap, f, max_reject_fraction)
+                    src_rec.update(records=n_rec, bytes_consumed=n_src - n_before, size=os.path.getsize(f),
+                                   sha256=M.sha256_file(f) if hash_sources else None)
+                elif fmt in ("jsonl", "parquet"):
                     recs = (_iter_jsonl_records if fmt == "jsonl" else _iter_parquet_records)(f, spec, rej)
                     n_rec = 0
                     for doc, group in recs:
@@ -759,6 +896,7 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
             raise ValueError(f"All files at {data_path} are empty (or entirely rejected); nothing to tokenize.")
 
         stream = np.memmap(stream_path, dtype=np.uint16, mode="r", shape=(n,))
+        mask_stream = np.memmap(mask_path, dtype=np.uint8, mode="r", shape=(n,)) if has_mask else None
         keep, n_dup = _keep_mask(index, dedup)
 
         # ---- decide the split policy
@@ -787,8 +925,12 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
         # ---- write the two splits (hashing as we go)
         train = _HashingSink(os.path.join(staging, "train.bin"))
         val = _HashingSink(os.path.join(staging, "val.bin"))
+        train_mask = _MaskSink(os.path.join(staging, "train.mask")) if has_mask else None
+        val_mask = _MaskSink(os.path.join(staging, "val.mask")) if has_mask else None
         if policy == "document":
             _write_document_split(stream, index, keep, val_fraction, train, val)
+            if has_mask:
+                _write_document_split_mask(mask_stream, index, keep, val_fraction, train_mask, val_mask)
         else:
             n_val = max(1, int(n * val_fraction))
             n_train = n - n_val
@@ -796,10 +938,18 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
                 raise ValueError("Dataset too small after train/val split; provide more data.")
             _copy_range(stream, 0, n_train, train)
             _copy_range(stream, n_train, n, val)
+            if has_mask:
+                _copy_range_mask(mask_stream, 0, n_train, train_mask)
+                _copy_range_mask(mask_stream, n_train, n, val_mask)
         train.close()
         val.close()
+        if has_mask:
+            train_mask.close()
+            val_mask.close()
         del stream
-        for tmp in (stream_path, index.path):
+        if mask_stream is not None:
+            del mask_stream
+        for tmp in (stream_path, mask_path, index.path):
             os.remove(tmp)
         if train.n_tokens == 0 or val.n_tokens == 0:
             raise ValueError("Dataset too small after train/val split; provide more data.")
@@ -810,6 +960,13 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
             "n_rejected": rej.n_rejected, "rejected_reasons": dict(rej.counts), "rejected_examples": rej.examples,
             "n_duplicates_dropped": n_dup, "source_bytes": int(n_src),
         }
+        files_dict: Dict[str, Any] = {
+            "train.bin": {"sha256": train.digest(), "bytes": train.n_tokens * 2},
+            "val.bin": {"sha256": val.digest(), "bytes": val.n_tokens * 2},
+        }
+        if has_mask:
+            files_dict["train.mask"] = {"sha256": train_mask.digest(), "bytes": train_mask.n_tokens}
+            files_dict["val.mask"] = {"sha256": val_mask.digest(), "bytes": val_mask.n_tokens}
         meta: Dict[str, Any] = {
             # ---- fields every release has written
             "vocab_size": ByteTokenizer.VOCAB_SIZE, "dtype": "uint16",
@@ -827,19 +984,21 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
                       "salt": salt.decode() if policy == "document" else None, "group_field": group_field,
                       "min_documents": min_documents, "dedup": dedup, "reason": reason},
             "counts": counts,
-            "files": {"train.bin": {"sha256": train.digest(), "bytes": train.n_tokens * 2},
-                      "val.bin": {"sha256": val.digest(), "bytes": val.n_tokens * 2}},
+            "files": files_dict,
             "sources": sources, "skipped_files": skipped,
             "preprocessing": {"text_field": spec.text_field, "record_template": record_template, "format": format,
                               "validate_utf8": validate_utf8, "max_reject_fraction": max_reject_fraction,
-                              "chunk_bytes": chunk_bytes},
+                              "chunk_bytes": chunk_bytes, "has_loss_mask": has_mask, "chatml_schema": "v1" if has_mask else None},
             "code_version": __version__,
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         meta["fingerprint"] = M.compute_fingerprint(meta)
         with open(os.path.join(staging, "meta.json"), "w") as fh:
             json.dump(meta, fh, indent=2)
-        status = _publish(staging, out_dir, ("train.bin", "val.bin", "meta.json"), meta["fingerprint"], overwrite, say)
+        publish_files = ("train.bin", "val.bin", "meta.json")
+        if has_mask:
+            publish_files = ("train.bin", "val.bin", "train.mask", "val.mask", "meta.json")
+        status = _publish(staging, out_dir, publish_files, meta["fingerprint"], overwrite, say)
         if status == "unchanged":
             meta = M.read_meta(out_dir)
     except BaseException:

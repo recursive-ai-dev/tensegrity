@@ -1,6 +1,12 @@
 #@title 2 · Download, prepare & audit the dataset { display-mode: "form" }
+DATASET = "tinystories-valid"  #@param ["tinystories-valid", "tinystories", "shakespeare", "custom"]
+DATA_MEGABYTES = None  #@param {type:"number"}  # for tinystories: limit MB (full is 1920)
+CUSTOM_DATA_PATH = ""  #@param {type:"string"}
+CUSTOM_DOC_SEPARATOR = ""  #@param {type:"string"}
 CUSTOM_TEXT_FIELD = ""  #@param {type:"string"}
 CUSTOM_RECORD_TEMPLATE = ""  #@param {type:"string"}
+FORMAT = "auto"  #@param ["auto", "text", "jsonl", "parquet", "chatml"]
+
 import hashlib, os, shutil
 
 PROJECT_DIR = tg.project_dir(USE_GOOGLE_DRIVE, "tensegrity")
@@ -8,7 +14,7 @@ SCRATCH = tg.local_scratch("tensegrity_data")
 _free = shutil.disk_usage(SCRATCH).free / 2**30
 print(f"project dir : {PROJECT_DIR}\nlocal scratch: {SCRATCH}  ({_free:.0f} GB free)")
 
-_prep_kw = {}
+_prep_kw = dict(format=FORMAT if FORMAT != "auto" else None)
 if DATASET == "custom":
     if not CUSTOM_DATA_PATH or not os.path.exists(CUSTOM_DATA_PATH):
         raise FileNotFoundError(
@@ -17,7 +23,7 @@ if DATASET == "custom":
     _src, _sep, _val = CUSTOM_DATA_PATH, (CUSTOM_DOC_SEPARATOR or None), 0.02
     # jsonl / parquet: name the text field, or stitch several fields into ONE document, e.g.
     #   CUSTOM_RECORD_TEMPLATE = "Q: {question}\nContext: {context}\nA: {answer}"
-    _prep_kw = dict(text_field=CUSTOM_TEXT_FIELD or None, record_template=CUSTOM_RECORD_TEMPLATE.replace("\\n", "\n") or None)
+    _prep_kw.update(dict(text_field=CUSTOM_TEXT_FIELD or None, record_template=CUSTOM_RECORD_TEMPLATE.replace("\\n", "\n") or None))
     _key = "custom-" + hashlib.md5(os.path.abspath(_src).encode()).hexdigest()[:8]
 else:
     _mb = DATA_MEGABYTES if DATASET == "tinystories" else None

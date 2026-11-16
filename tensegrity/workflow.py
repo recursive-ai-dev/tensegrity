@@ -10,6 +10,8 @@ while the model, the trainer and the evaluation suite stay oblivious to the expe
   revert**. A rejected candidate is simply not used; the parent is still exactly what it was.
 * :func:`compare_continual_strategies` -- new-data-only vs replay vs replay + EWC from the same weights
   under matched budgets, judged on old-domain degradation *and* new-domain gain (not on a total objective).
+* :func:`prepare_sft_from_base` -- prepare a pretrained base checkpoint for ChatML SFT by expanding
+  vocabulary and updating hyperparameters.
 """
 
 from __future__ import annotations
@@ -425,3 +427,71 @@ def compare_continual_strategies(
             json.dump(report.to_dict(), fh, indent=2)
     say(report.table())
     return report
+
+
+# =============================================================================
+# SFT workflow: prepare base checkpoint for ChatML fine-tuning
+# =============================================================================
+
+def prepare_sft_from_base(base_ckpt_path: str, new_vocab_size: int = 265, new_block_size: int = 2048,
+                          new_rope_base: float = 50000.0, device: str = "cpu"
+                          ) -> Tuple[TensegrityLM, TensegrityConfig]:
+    """Prepare a pretrained base checkpoint for ChatML SFT.
+
+    This function:
+    1. Loads the base checkpoint
+    2. Expands token_emb and lm_head to accommodate ChatML control tokens
+    3. Initializes new control token embeddings to the normalized mean of existing embeddings
+       plus small orthogonal noise (so they train rapidly without logit spikes)
+    4. Updates block_size and rope_base for longer context
+    5. Verifies forward parity on standard byte inputs
+
+    Args:
+        base_ckpt_path: Path to the pretrained base checkpoint
+        new_vocab_size: New vocabulary size (default 265 for ChatML)
+        new_block_size: New context length (default 2048)
+        new_rope_base: New RoPE base (default 50000.0)
+        device: Device to load the model on
+
+    Returns:
+        Tuple of (model, config) ready for SFT training
+    """
+    from .growth import grow_model
+
+    # Load base model
+    base_model, base_cfg, _ = load_model(base_ckpt_path, device)
+
+    # Create target config with expanded vocab and updated hyperparams
+    target_cfg = base_cfg.replace(
+        vocab_size=new_vocab_size,
+        block_size=new_block_size,
+        rope_base=new_rope_base,
+        confidence_detach=True,  # Calibrated confidence for chat
+    )
+
+    # Grow the model (this handles embedding expansion with proper initialization)
+    sft_model, sft_cfg = grow_model(base_model, base_cfg, target=target_cfg, device=device)
+
+    # Verify forward parity on standard byte inputs (0-255 + EOS)
+    base_model.eval()
+    sft_model.eval()
+    with torch.no_grad():
+        # Test on random byte sequences
+        g = torch.Generator(device=device).manual_seed(42)
+        test_input = torch.randint(0, 259, (2, 128), generator=g, device=device)
+        base_logits, _, _ = base_model(test_input)
+        sft_logits, _, _ = sft_model(test_input)
+
+        # Check that logits for original vocab match closely
+        max_diff = (base_logits - sft_logits[..., :base_cfg.vocab_size]).abs().max().item()
+        if max_diff > 1e-4:
+            print(f"[sft] Warning: forward parity check max diff = {max_diff:.6f} (expected < 1e-4)")
+        else:
+            print(f"[sft] Forward parity verified: max diff = {max_diff:.6f}")
+
+    print(f"[sft] Base {base_cfg.n_params()/1e6:.2f}M -> SFT {sft_cfg.n_params()/1e6:.2f}M "
+          f"(vocab {base_cfg.vocab_size} -> {sft_cfg.vocab_size}, "
+          f"ctx {base_cfg.block_size} -> {sft_cfg.block_size}, "
+          f"rope_base {base_cfg.rope_base:.0f} -> {sft_cfg.rope_base:.0f})")
+
+    return sft_model, sft_cfg

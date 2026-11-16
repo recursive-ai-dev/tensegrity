@@ -260,3 +260,16 @@ class TensegrityConfig:
         return (f"{n / 1e6:.2f}M params | L={self.n_layer}{loops} d={self.n_embd} "
                 f"heads={self.n_head}/{self.n_kv_head}kv (hd={self.head_dim}) ffn={self.ffn_hidden} "
                 f"ctx={self.block_size} win={self.sliding_window} layers[{kinds}] {reach}")
+
+    def upgrade_vocab(self, new_vocab_size: int = 265) -> "TensegrityConfig":
+        """Return a new config with expanded vocabulary for ChatML control tokens.
+
+        Uses grow_model logic: new embedding rows are initialized to the mean of existing
+        embeddings (handled by grow_model in growth.py). This allows pretrained base models
+        to adapt smoothly during SFT.
+        """
+        if new_vocab_size < self.vocab_size:
+            raise ValueError(f"Cannot downgrade vocab from {self.vocab_size} to {new_vocab_size}")
+        if new_vocab_size == self.vocab_size:
+            return self
+        return self.replace(vocab_size=new_vocab_size)

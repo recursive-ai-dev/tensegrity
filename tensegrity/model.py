@@ -10,6 +10,8 @@ vanilla transformer of equal size):
   * activation-RMS "homeostasis" loss     * depth-scaled LayerDrop
   * z-loss, logit soft-capping            * optional confidence head (adaptive sampling temperature)
   * optional ByteMix (causal FIR over recent byte embeddings) and x0-mix (embedding re-injection)
+  * repetition penalties (presence/frequency/repetition)
+  * multi-token stop sequences
 """
 
 from __future__ import annotations
@@ -216,9 +218,13 @@ class TensegrityLM(nn.Module):
             h = x.detach() if cfg.confidence_detach else x
             conf_logits = self.confidence_head(h).squeeze(-1)
             with torch.no_grad():
-                correct = (logits.argmax(dim=-1) == targets).float()
+                # Soft target probability for calibration (instead of binary correct/incorrect)
+                probs = torch.softmax(logits_f, dim=-1)
                 valid = (targets != -1).float()
-            raw = F.binary_cross_entropy_with_logits(conf_logits.float(), correct, reduction="none")
+                # Gather probability of the target token (clamp targets to valid range for gather)
+                target_prob = probs.gather(-1, targets.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+                # For ignored positions (-1), target_prob will be prob of token 0, but masked out by valid=0
+            raw = F.binary_cross_entropy_with_logits(conf_logits.float(), target_prob, reduction="none")
             conf_loss = (raw * valid).sum() / valid.sum().clamp_min(1.0)
             losses["confidence_loss"] = conf_loss
             total = total + cfg.confidence_weight * conf_loss
@@ -291,9 +297,15 @@ class TensegrityLM(nn.Module):
     @staticmethod
     def _sample_next(logits: torch.Tensor, temperature: float, top_k: Optional[int],
                      top_p: Optional[float], min_p: Optional[float],
-                     conf: Optional[torch.Tensor], conf_temp_min: float, conf_temp_max: float
-                     ) -> torch.Tensor:
-        """logits: (B, V) -> next token ids (B, 1)."""
+                     conf: Optional[torch.Tensor], conf_temp_min: float, conf_temp_max: float,
+                     repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
+                     presence_penalty: float = 0.0, penalty_window: int = 256,
+                     generated_tokens: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """logits: (B, V) -> next token ids (B, 1).
+
+        Repetition penalties are applied based on the trailing ``penalty_window`` tokens
+        of the generated sequence (passed via ``generated_tokens``).
+        """
         logits = logits.float()
         if temperature == 0.0:  # an explicit greedy request always wins over confidence scaling
             return logits.argmax(dim=-1, keepdim=True)
@@ -305,6 +317,28 @@ class TensegrityLM(nn.Module):
         else:
             logits = logits / max(temperature, 1e-4)
         fallback = logits.argmax(dim=-1, keepdim=True)
+
+        # Apply repetition penalties (HuggingFace + OpenAI style)
+        if generated_tokens is not None and (repetition_penalty != 1.0 or frequency_penalty != 0.0 or presence_penalty != 0.0):
+            # Count token occurrences in the trailing penalty_window
+            tail = generated_tokens[:, -penalty_window:] if generated_tokens.size(1) > penalty_window else generated_tokens
+            B, V = logits.shape
+            for b in range(B):
+                token_counts = torch.bincount(tail[b], minlength=V).float()
+                if repetition_penalty != 1.0:
+                    # Multiplicative penalty: divide positive logits, multiply negative logits for seen tokens
+                    seen = token_counts > 0
+                    logits[b, seen] = torch.where(
+                        logits[b, seen] > 0,
+                        logits[b, seen] / repetition_penalty,
+                        logits[b, seen] * repetition_penalty
+                    )
+                if frequency_penalty != 0.0:
+                    # Additive frequency penalty
+                    logits[b] = logits[b] - frequency_penalty * token_counts
+                if presence_penalty != 0.0:
+                    # Additive presence penalty (once per unique token)
+                    logits[b] = logits[b] - presence_penalty * (token_counts > 0).float()
 
         if top_k is not None:
             kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, -1:]
@@ -329,10 +363,43 @@ class TensegrityLM(nn.Module):
             return torch.where(bad.unsqueeze(-1), fallback, sampled)
         return torch.multinomial(probs, 1)
 
+    def _check_stop_sequences(self, generated: torch.Tensor, stop_token_ids: Tuple[int, ...],
+                              stop_strings: Tuple[str, ...], tokenizer: ByteTokenizer) -> torch.Tensor:
+        """Check if any stop sequence has been generated.
+
+        Returns boolean tensor of shape (B,) indicating which sequences should stop.
+        """
+        B = generated.size(0)
+        should_stop = torch.zeros(B, dtype=torch.bool, device=generated.device)
+
+        # Check stop token IDs (single token)
+        if stop_token_ids:
+            last_token = generated[:, -1]
+            for stop_id in stop_token_ids:
+                should_stop = should_stop | (last_token == stop_id)
+
+        # Check stop strings (multi-token)
+        if stop_strings:
+            # Decode recent tail for each sequence
+            tail_len = max(len(s.encode('utf-8')) for s in stop_strings) + 2  # extra for IM_END, etc.
+            tail_tokens = generated[:, -tail_len:] if generated.size(1) > tail_len else generated
+            for b in range(B):
+                tail_text = tokenizer.decode(tail_tokens[b].tolist(), skip_special_tokens=False)
+                for stop_str in stop_strings:
+                    if stop_str in tail_text:
+                        should_stop[b] = True
+                        break
+
+        return should_stop
+
     def _generate_stream_iter(self, idx: torch.Tensor, max_new_tokens: int, temperature: float,
                               top_k: Optional[int], top_p: Optional[float], min_p: Optional[float],
                               use_confidence_temp: bool, conf_temp_min: float, conf_temp_max: float,
-                              stop_on_eos: bool) -> Iterator[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+                              stop_on_eos: bool, repetition_penalty: float = 1.0,
+                              frequency_penalty: float = 0.0, presence_penalty: float = 0.0,
+                              penalty_window: int = 256,
+                              stop_token_ids: Tuple[int, ...] = (ByteTokenizer.EOS, ByteTokenizer.IM_END),
+                              stop_strings: Tuple[str, ...] = ()) -> Iterator[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Streaming-cache decoding: one prefill, then O(1) work per token forever (see ``generate``)."""
         bs, K = self.cfg.block_size, self.cfg.byte_mix_kernel
         m = max(K - 1, 0)                                   # ByteMix needs the previous K-1 tokens
@@ -345,16 +412,30 @@ class TensegrityLM(nn.Module):
             logits, past, conf = self.forward_incremental(window, None, 0, streaming=True)
             pos = window.size(1)                            # absolute stream position of the next token
             tail = window[:, -m:] if m else None
+            all_generated = idx.clone()
             for step in range(max_new_tokens):
                 next_tok = self._sample_next(
                     logits[:, -1, :], temperature, top_k, top_p, min_p,
-                    conf[:, -1] if (use_confidence_temp and conf is not None) else None, conf_temp_min, conf_temp_max)
+                    conf[:, -1] if (use_confidence_temp and conf is not None) else None,
+                    conf_temp_min, conf_temp_max,
+                    repetition_penalty, frequency_penalty, presence_penalty, penalty_window,
+                    all_generated)
                 if stop_on_eos:
                     next_tok = torch.where(finished.unsqueeze(-1), torch.full_like(next_tok, ByteTokenizer.EOS), next_tok)
                     finished = finished | (next_tok.squeeze(-1) == ByteTokenizer.EOS)
                 yield next_tok, (conf[:, -1] if conf is not None else None)
                 if (stop_on_eos and bool(finished.all())) or step == max_new_tokens - 1:
                     break
+                all_generated = torch.cat([all_generated, next_tok], dim=1)
+                # Check stop sequences
+                if stop_token_ids or stop_strings:
+                    should_stop = self._check_stop_sequences(all_generated, stop_token_ids, stop_strings, ByteTokenizer())
+                    if stop_on_eos:
+                        finished = finished | should_stop
+                    else:
+                        finished = should_stop
+                    if bool(finished.all()):
+                        break
                 logits, past, conf = self.forward_incremental(next_tok, past, pos, tail, streaming=True)
                 pos += 1
                 if m:
@@ -365,8 +446,11 @@ class TensegrityLM(nn.Module):
     def _generate_iter(self, idx: torch.Tensor, max_new_tokens: int, temperature: float,
                        top_k: Optional[int], top_p: Optional[float], min_p: Optional[float],
                        use_confidence_temp: bool, conf_temp_min: float, conf_temp_max: float,
-                       stop_on_eos: bool, use_cache: bool, rebuild_stride: int, cache_mode: str = "window"
-                       ) -> Iterator[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+                       stop_on_eos: bool, use_cache: bool, rebuild_stride: int, cache_mode: str = "window",
+                       repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
+                       presence_penalty: float = 0.0, penalty_window: int = 256,
+                       stop_token_ids: Tuple[int, ...] = (ByteTokenizer.EOS, ByteTokenizer.IM_END),
+                       stop_strings: Tuple[str, ...] = ()) -> Iterator[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Yield ``(next_tok (B,1), confidence (B,) | None)`` for each generated position."""
         if cache_mode not in ("window", "streaming"):
             raise ValueError(f"cache_mode must be 'window' or 'streaming', got {cache_mode!r}")
@@ -398,7 +482,9 @@ class TensegrityLM(nn.Module):
         K = self.cfg.byte_mix_kernel
         if cache_mode == "streaming":
             yield from self._generate_stream_iter(idx, max_new_tokens, temperature, top_k, top_p, min_p,
-                                                  use_confidence_temp, conf_temp_min, conf_temp_max, stop_on_eos)
+                                                  use_confidence_temp, conf_temp_min, conf_temp_max, stop_on_eos,
+                                                  repetition_penalty, frequency_penalty, presence_penalty,
+                                                  penalty_window, stop_token_ids, stop_strings)
             return
 
         was_training = self.training
@@ -408,6 +494,7 @@ class TensegrityLM(nn.Module):
             finished = torch.zeros(B, dtype=torch.bool, device=idx.device) if stop_on_eos else None
             window = idx[:, -bs:]  # the tokens the next prediction is conditioned on
             past: Optional[List[KV]] = None
+            all_generated = idx.clone()
             for _ in range(max_new_tokens):
                 if window.size(1) > bs:
                     # Context overflow: re-prefill from a trimmed window. stride=1 keeps exactly the
@@ -430,14 +517,24 @@ class TensegrityLM(nn.Module):
                 next_tok = self._sample_next(
                     logits, temperature, top_k, top_p, min_p,
                     conf if (use_confidence_temp and conf is not None) else None,
-                    conf_temp_min, conf_temp_max)
+                    conf_temp_min, conf_temp_max,
+                    repetition_penalty, frequency_penalty, presence_penalty, penalty_window,
+                    all_generated)
                 if stop_on_eos:
                     # freeze finished rows instead of letting them drift while others finish
                     next_tok = torch.where(finished.unsqueeze(-1),
                                            torch.full_like(next_tok, ByteTokenizer.EOS), next_tok)
                     finished = finished | (next_tok.squeeze(-1) == ByteTokenizer.EOS)
                 window = torch.cat([window, next_tok], dim=1)
+                all_generated = torch.cat([all_generated, next_tok], dim=1)
                 yield next_tok, conf
+                # Check stop sequences
+                if stop_token_ids or stop_strings:
+                    should_stop = self._check_stop_sequences(all_generated, stop_token_ids, stop_strings, ByteTokenizer())
+                    if stop_on_eos:
+                        finished = finished | should_stop
+                    else:
+                        finished = should_stop
                 if stop_on_eos and bool(finished.all()):
                     break
         finally:
@@ -449,7 +546,11 @@ class TensegrityLM(nn.Module):
                  min_p: Optional[float] = None, use_confidence_temp: bool = False,
                  conf_temp_min: float = 0.5, conf_temp_max: float = 1.5,
                  stop_on_eos: bool = True, use_cache: bool = True, rebuild_stride: int = 1,
-                 return_confidence: bool = False, cache_mode: str = "window"):
+                 return_confidence: bool = False, cache_mode: str = "window",
+                 repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
+                 presence_penalty: float = 0.0, penalty_window: int = 256,
+                 stop_token_ids: Tuple[int, ...] = (ByteTokenizer.EOS, ByteTokenizer.IM_END),
+                 stop_strings: Tuple[str, ...] = ()) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Autoregressive sampling.
 
         Returns ``(B, T + new)`` ids (shorter if every row hit EOS; finished rows are padded
@@ -474,11 +575,19 @@ class TensegrityLM(nn.Module):
             and for a one-layer model whose attention does not reach the window start (any local layer; a global
             layer without ByteMix); otherwise measure the gap with :func:`tensegrity.evaluation.long_stream_nll`
             before relying on it.
+        repetition_penalty: multiplicative penalty for repeated tokens (HuggingFace style).
+        frequency_penalty: additive penalty proportional to token frequency (OpenAI style).
+        presence_penalty: additive penalty for token presence (OpenAI style).
+        penalty_window: number of recent tokens to consider for penalties.
+        stop_token_ids: single token IDs that trigger stopping (default: EOS, IM_END).
+        stop_strings: multi-byte string sequences that trigger stopping (e.g., "\nUser:", "\n<|im_start|>user").
         """
         toks, confs = [idx], []
         for next_tok, conf in self._generate_iter(
                 idx, max_new_tokens, temperature, top_k, top_p, min_p, use_confidence_temp,
-                conf_temp_min, conf_temp_max, stop_on_eos, use_cache, rebuild_stride, cache_mode):
+                conf_temp_min, conf_temp_max, stop_on_eos, use_cache, rebuild_stride, cache_mode,
+                repetition_penalty, frequency_penalty, presence_penalty, penalty_window,
+                stop_token_ids, stop_strings):
             toks.append(next_tok)
             confs.append(conf)
         out = torch.cat(toks, dim=1)
@@ -495,7 +604,8 @@ class TensegrityLM(nn.Module):
             raise ValueError("stream() supports a single sequence (batch size 1)")
         kw = dict(temperature=1.0, top_k=None, top_p=None, min_p=None, use_confidence_temp=False,
                   conf_temp_min=0.5, conf_temp_max=1.5, stop_on_eos=True, use_cache=True, rebuild_stride=1,
-                  cache_mode="window")
+                  cache_mode="window", repetition_penalty=1.0, frequency_penalty=0.0, presence_penalty=0.0,
+                  penalty_window=256, stop_token_ids=(ByteTokenizer.EOS, ByteTokenizer.IM_END), stop_strings=())
         unknown = set(kwargs) - set(kw)
         if unknown:
             raise TypeError(f"stream() got unexpected keyword argument(s) {sorted(unknown)}")

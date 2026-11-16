@@ -3,7 +3,8 @@ import shutil, time
 
 DEVICE = tg.pick_device("auto")
 DTYPE = tg.pick_dtype("auto", DEVICE)
-PRESET = tg.get_preset(MODEL_SIZE)
+MODEL_SIZE = "5m"  #@param ["1m", "2m", "5m", "10m", "50m", "115m", "5m-chat", "10m-chat", "50m-chat", "115m-chat"]
+PRESET = tg.get_preset(MODEL_SIZE) if MODEL_SIZE in tg.LADDER_NAMES else tg.get_chat_preset(MODEL_SIZE)
 _CPU_MODE = SMOKE_TEST or DEVICE == "cpu"
 MODEL_OVERRIDES = dict(block_size=128, sliding_window=32) if _CPU_MODE else {}
 BATCH_TOKENS = 4096 if _CPU_MODE else PRESET.batch_tokens      # small optimizer steps keep CPU runs responsive

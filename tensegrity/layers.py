@@ -166,8 +166,23 @@ def _band_mask(n_chunks: int, window: int, batch: int, device: torch.device) -> 
     return m
 
 
+def _intra_doc_attn_mask(doc_ids: torch.Tensor) -> torch.Tensor:
+    """Construct intra-document causal mask from doc_ids.
+
+    doc_ids: (B, T) - document ID for each position
+    Returns: (B, 1, T, T) boolean mask where True means "attend"
+    """
+    # (B, 1, T, 1) == (B, 1, 1, T) -> (B, 1, T, T)
+    same_doc = (doc_ids[:, None, :, None] == doc_ids[:, None, None, :])
+    # Causal mask: can only attend to same or earlier positions
+    T = doc_ids.shape[1]
+    causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=doc_ids.device)).view(1, 1, T, T)
+    return same_doc & causal
+
+
 def local_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int,
-                           n_rep: int, dropout_p: float = 0.0) -> torch.Tensor:
+                           n_rep: int, dropout_p: float = 0.0,
+                           doc_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Sliding-window causal attention in ONE fused SDPA call.
 
     The sequence is cut into chunks of ``window`` queries; each chunk attends to the
@@ -176,11 +191,20 @@ def local_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, wi
     and no (T, T) tensor. Result equals dense masked attention exactly.
 
     q: (B, H, T, D); k, v: (B, Hkv, T, D). Returns (B, H, T, D).
+
+    If doc_ids is provided, attention is masked to prevent cross-document attention.
     """
     B, H, T, D = q.shape
     Hkv = k.shape[1]
     W = window
     if T <= W:  # window covers everything -> plain causal attention
+        if doc_ids is not None:
+            attn_mask = _intra_doc_attn_mask(doc_ids)
+            if n_rep > 1 and native_gqa_ok(q):
+                return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, enable_gqa=True)
+            if n_rep > 1:
+                k, v = _expand_kv(k, v, n_rep)
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
         if n_rep > 1 and native_gqa_ok(q):
             return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=True, enable_gqa=True)
         if n_rep > 1:
@@ -203,6 +227,23 @@ def local_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, wi
         kf, vf = _expand_kv(kf, vf, n_rep)
 
     mask = _band_mask(n_chunks, W, B, q.device)
+    if doc_ids is not None:
+        # Slice doc_ids to match the chunked layout: (B * n_chunks, 1, 1, 2W)
+        # For each chunk c, we need doc_ids for the 2W keys [prev_chunk | curr_chunk]
+        # Reshape doc_ids from (B, T) to (B, n_chunks, W)
+        doc_chunks = doc_ids[:, :n_chunks * W].view(B, n_chunks, W)
+        # For each chunk, concat with previous chunk's doc_ids
+        prev_doc = F.pad(doc_chunks, (0, 0, 1, 0))[:, :-1]  # (B, n_chunks, W)
+        key_doc_ids = torch.cat([prev_doc, doc_chunks], dim=2)  # (B, n_chunks, 2W)
+        # Reshape for SDPA: (B * n_chunks, 1, 1, 2W)
+        key_doc_ids = key_doc_ids.reshape(B * n_chunks, 1, 1, 2 * W)
+        # Query doc_ids: (B * n_chunks, 1, W, 1)
+        q_doc_ids = doc_chunks.reshape(B * n_chunks, 1, W, 1)
+        # Same doc mask: (B * n_chunks, 1, W, 2W)
+        same_doc = (q_doc_ids == key_doc_ids)
+        # Combine with band mask
+        mask = mask & same_doc
+
     yf = F.scaled_dot_product_attention(qf, kf, vf, attn_mask=mask, dropout_p=dropout_p)
     y = yf.view(B, n_chunks, H, W, D).transpose(1, 2).reshape(B, H, n_chunks * W, D)
     return y[:, :, :T] if pad else y
@@ -253,13 +294,16 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                 past: Optional[KV] = None, return_kv: bool = False, max_cache: Optional[int] = None,
-                v0: Optional[torch.Tensor] = None, return_v0: bool = False):
+                v0: Optional[torch.Tensor] = None, return_v0: bool = False,
+                doc_ids: Optional[torch.Tensor] = None):
         """
         Training / prefill (``past is None``): full-sequence attention starting at position 0.
         Decode (``past`` given): ``x`` must be ONE new token; its K/V are appended to ``past``.
         With ``return_kv`` the (trimmed) cache for subsequent decode steps is returned too.
         ``max_cache`` bounds a GLOBAL layer's cache to the most recent ``max_cache`` keys (streaming decode);
         local layers are always bounded by their window.
+
+        If doc_ids is provided (training only), attention is masked to prevent cross-document attention.
         """
         B, T, _ = x.shape
         q, k, v, v_raw = self._project(x, cos, sin, v0)
@@ -276,14 +320,21 @@ class CausalSelfAttention(nn.Module):
             ke, ve = _expand_kv(k, v, self.n_rep)
             y = F.scaled_dot_product_attention(q, ke, ve)  # every cached key is causally visible
         elif self.is_global:
-            if self.n_rep > 1 and native_gqa_ok(q):
+            if doc_ids is not None:
+                attn_mask = _intra_doc_attn_mask(doc_ids)
+                if self.n_rep > 1 and native_gqa_ok(q):
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, enable_gqa=True)
+                else:
+                    ke, ve = _expand_kv(k, v, self.n_rep)
+                    y = F.scaled_dot_product_attention(q, ke, ve, attn_mask=attn_mask, dropout_p=dropout_p)
+            elif self.n_rep > 1 and native_gqa_ok(q):
                 y = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=True,
                                                    enable_gqa=True)
             else:
                 ke, ve = _expand_kv(k, v, self.n_rep)
                 y = F.scaled_dot_product_attention(q, ke, ve, dropout_p=dropout_p, is_causal=True)
         else:
-            y = local_causal_attention(q, k, v, self.sliding_window, self.n_rep, dropout_p)
+            y = local_causal_attention(q, k, v, self.sliding_window, self.n_rep, dropout_p, doc_ids)
 
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim)
         y = self.resid_dropout(self.o_proj(y))
@@ -361,14 +412,15 @@ class Block(nn.Module):
 
     def _forward_impl(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                       x0: Optional[torch.Tensor] = None, v0: Optional[torch.Tensor] = None,
-                      loop_idx: int = 0, need_v0: bool = False):
+                      loop_idx: int = 0, need_v0: bool = False,
+                      doc_ids: Optional[torch.Tensor] = None):
         ag, fg, xg = self._gains(loop_idx)
         if xg is not None and x0 is not None:
             x = x + xg * x0
         if need_v0:
-            attn_out, v0_out = self.attn(self.ln1(x), cos, sin, v0=v0, return_v0=True)
+            attn_out, v0_out = self.attn(self.ln1(x), cos, sin, v0=v0, return_v0=True, doc_ids=doc_ids)
         else:
-            attn_out, v0_out = self.attn(self.ln1(x), cos, sin, v0=v0), v0
+            attn_out, v0_out = self.attn(self.ln1(x), cos, sin, v0=v0, doc_ids=doc_ids), v0
         homeo = self._homeo(attn_out, x)
         x = x + ag * attn_out
         ffn_out = self.ffn(self.ln2(x))
@@ -378,8 +430,10 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                 x0: Optional[torch.Tensor] = None, v0: Optional[torch.Tensor] = None,
-                loop_idx: int = 0, return_v0: bool = False):
-        x, homeo, v0_out = self._forward_impl(x, cos, sin, x0, v0, loop_idx, need_v0=return_v0 and v0 is None)
+                loop_idx: int = 0, return_v0: bool = False,
+                doc_ids: Optional[torch.Tensor] = None):
+        x, homeo, v0_out = self._forward_impl(x, cos, sin, x0, v0, loop_idx, need_v0=return_v0 and v0 is None,
+                                               doc_ids=doc_ids)
         return (x, homeo, v0_out) if return_v0 else (x, homeo)
 
     def forward_incremental(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
@@ -428,19 +482,49 @@ class ByteMix(nn.Module):
 
     def forward(self, e: torch.Tensor, n_prefix: int) -> torch.Tensor:
         """e: (B, n_prefix + T, C) embeddings whose first ``n_prefix`` (= K-1) rows are
-        left context. Returns (B, T, C)."""
+        left context. Returns (B, T, C).
+
+        Vectorized implementation using unfold for all K-1 taps at once.
+        """
         T = e.shape[1] - n_prefix
         cur = e[:, n_prefix:]
         out = cur
         w = self.weight if e.dtype == self.weight.dtype else self.weight.to(e.dtype)
-        if self.bi_weight is not None:
-            bw = self.bi_weight if e.dtype == self.bi_weight.dtype else self.bi_weight.to(e.dtype)
-            scale = self.init_std * (e.shape[-1] ** 0.5 if self.embed_scale else 1.0)
-            g = torch.tanh(cur * (1.0 / scale))
-            for j in range(1, self.kernel):
-                prev = e[:, n_prefix - j: n_prefix - j + T]
-                out = out + (w[j - 1] + bw[j - 1] * g) * prev
-            return out
-        for j in range(1, self.kernel):
-            out = out + w[j - 1] * e[:, n_prefix - j: n_prefix - j + T]
+
+        # Use unfold to get all K-1 previous positions at once
+        # e has shape (B, n_prefix + T, C)
+        # We want to extract windows of size kernel-1 for each position in cur
+        # unfold on dim=1 (sequence) with size=kernel, step=1
+        # This gives (B, T, kernel, C) where [:, t, 0] = cur[:, t]
+        # and [:, t, 1:] = previous K-1 positions
+        if self.kernel > 1:
+            # Extract the K-1 previous tokens for each current position
+            # We need e[:, n_prefix - (kernel-1) : n_prefix + T - 1] unfolded
+            prev = e.unfold(dimension=1, size=self.kernel, step=1)  # (B, n_prefix + T - kernel + 1, kernel, C)
+            # We only need the part corresponding to cur (T positions)
+            # The first n_prefix positions of prev correspond to prefix context
+            # The next T positions correspond to cur
+            prev = prev[:, n_prefix - 1: n_prefix - 1 + T]  # (B, T, kernel, C)
+            # prev[:, t, 0] = e[:, n_prefix + t] = cur[:, t]
+            # prev[:, t, 1:] = previous K-1 tokens
+            prev_taps = prev[:, :, 1:]  # (B, T, kernel-1, C)
+
+            if self.bi_weight is not None:
+                bw = self.bi_weight if e.dtype == self.bi_weight.dtype else self.bi_weight.to(e.dtype)
+                scale = self.init_std * (e.shape[-1] ** 0.5 if self.embed_scale else 1.0)
+                g = torch.tanh(cur * (1.0 / scale))  # (B, T, C)
+                # Vectorized: (w + bi * g) * prev_taps summed over kernel-1
+                # w: (K-1, C), bw: (K-1, C), g: (B, T, C), prev_taps: (B, T, K-1, C)
+                # Need to broadcast: (1, 1, K-1, C) * (B, T, K-1, C)
+                w_exp = w.unsqueeze(0).unsqueeze(0)  # (1, 1, K-1, C)
+                bw_exp = bw.unsqueeze(0).unsqueeze(0)  # (1, 1, K-1, C)
+                g_exp = g.unsqueeze(2)  # (B, T, 1, C)
+                taps = (w_exp + bw_exp * g_exp) * prev_taps  # (B, T, K-1, C)
+                out = out + taps.sum(dim=2)
+            else:
+                # Simple linear: sum w_j * prev_taps[:, :, j]
+                w_exp = w.unsqueeze(0).unsqueeze(0)  # (1, 1, K-1, C)
+                taps = w_exp * prev_taps  # (B, T, K-1, C)
+                out = out + taps.sum(dim=2)
+
         return out

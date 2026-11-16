@@ -13,6 +13,12 @@ preservation -- verified for every adjacent pair in tests/test_presets.py):
 Training defaults (batch size, learning rate, byte budget) are starting points chosen from
 standard width-scaling heuristics and the small ablations in tools/ablate.py; they are not
 tuned per-size on large runs. Treat them as defaults, not optima.
+
+Chat variants (``*-chat``) have:
+  * block_size = 2048 (5M/10M) or 4096 (50M/115M)
+  * rope_base = 50000.0 (prevents RoPE aliasing across multi-kilobyte conversations)
+  * vocab_size = 265 (includes ChatML control tokens)
+  * confidence_detach = True (calibrated confidence head)
 """
 
 from __future__ import annotations
@@ -97,11 +103,65 @@ LADDER: Tuple[Preset, ...] = (
 
 _BY_NAME: Dict[str, Preset] = {p.name: p for p in LADDER}
 LADDER_NAMES: Tuple[str, ...] = tuple(p.name for p in LADDER)
-MODEL_PRESETS: Dict[str, Dict[str, Any]] = {**LEGACY_PRESETS, **{p.name: p.model_kwargs for p in LADDER}}
 
 
 def _norm(name: str) -> str:
     return name.strip().lower().replace(" ", "")
+
+
+# Chat variants: longer context, higher RoPE base, ChatML vocab
+CHAT_LADDER_COMMON: Dict[str, Any] = dict(
+    block_size=2048, sliding_window=256, global_every=3, ffn_align=32,
+    layerdrop_max=0.0, grad_checkpoint=False,
+    use_qk_norm=True, embed_scale=False, logit_soft_cap=30.0, z_loss_weight=1e-4,
+    confidence_detach=True, byte_mix_kernel=4, byte_mix_bilinear=True,
+    x0_mix=True, v0_mix=True, n_loops=1, homeo_weight=0.01,
+    rope_base=50000.0, vocab_size=265,
+)
+
+# Override block_size for larger models
+CHAT_LADDER_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "50m": {"block_size": 4096},
+    "115m": {"block_size": 4096},
+}
+
+@dataclass(frozen=True)
+class ChatPreset:
+    name: str                 # "5m-chat"
+    base_name: str            # "5m"
+    label: str                # "5M Chat"
+    blurb: str
+
+    @property
+    def model_kwargs(self) -> Dict[str, Any]:
+        base = _BY_NAME[_norm(self.base_name)]
+        heads = base.n_embd // _HEAD_DIM
+        kwargs = {**CHAT_LADDER_COMMON, "n_layer": base.n_layer, "n_embd": base.n_embd,
+                  "n_head": heads, "n_kv_head": heads // 2,
+                  "ffn_mult": base.ffn_hidden / base.n_embd}
+        if self.base_name in CHAT_LADDER_OVERRIDES:
+            kwargs.update(CHAT_LADDER_OVERRIDES[self.base_name])
+        return kwargs
+
+
+CHAT_LADDER: Tuple[ChatPreset, ...] = (
+    ChatPreset("1m-chat", "1m", "1M Chat", "Tiny chat model for testing."),
+    ChatPreset("2m-chat", "2m", "2M Chat", "Minimal chat model."),
+    ChatPreset("5m-chat", "5m", "5M Chat", "Chat variant with 2K context."),
+    ChatPreset("10m-chat", "10m", "10M Chat", "Chat variant with 2K context."),
+    ChatPreset("50m-chat", "50m", "50M Chat", "Chat variant with 4K context."),
+    ChatPreset("115m-chat", "115m", "115M Chat", "Chat variant with 4K context."),
+)
+
+_CHAT_BY_NAME: Dict[str, ChatPreset] = {p.name: p for p in CHAT_LADDER}
+CHAT_PRESET_NAMES: Tuple[str, ...] = tuple(p.name for p in CHAT_LADDER)
+
+# Build MODEL_PRESETS including chat variants
+MODEL_PRESETS: Dict[str, Dict[str, Any]] = {**LEGACY_PRESETS, **{p.name: p.model_kwargs for p in LADDER}}
+CHAT_MODEL_PRESETS: Dict[str, Dict[str, Any]] = {p.name: p.model_kwargs for p in CHAT_LADDER}
+MODEL_PRESETS.update(CHAT_MODEL_PRESETS)
+
+ALL_PRESET_NAMES: Tuple[str, ...] = LADDER_NAMES + CHAT_PRESET_NAMES + tuple(LEGACY_PRESETS.keys())
 
 
 def get_preset(name: str) -> Preset:
@@ -112,8 +172,16 @@ def get_preset(name: str) -> Preset:
     return _BY_NAME[key]
 
 
+def get_chat_preset(name: str) -> ChatPreset:
+    """Chat ladder preset by name, case-insensitive: "5m-chat", "5M-CHAT"."""
+    key = _norm(name)
+    if key not in _CHAT_BY_NAME:
+        raise ValueError(f"unknown chat preset {name!r}; available: {list(CHAT_PRESET_NAMES)}")
+    return _CHAT_BY_NAME[key]
+
+
 def get_preset_config(name: str, **overrides: Any) -> TensegrityConfig:
-    """TensegrityConfig for a ladder or legacy preset, with optional field overrides
+    """TensegrityConfig for a ladder, chat, or legacy preset, with optional field overrides
     (e.g. ``get_preset_config("5m", dropout=0.1, block_size=2048)``)."""
     key = _norm(name)
     if key not in MODEL_PRESETS:
@@ -125,18 +193,31 @@ def get_preset_config(name: str, **overrides: Any) -> TensegrityConfig:
 
 def next_preset(name: str) -> Optional[Preset]:
     """The rung above ``name`` on the ladder (None at the top)."""
+    key = _norm(name)
+    if key in _CHAT_BY_NAME:
+        base = _CHAT_BY_NAME[key].base_name
+        nxt = next_preset(base)
+        return _CHAT_BY_NAME.get(f"{nxt.name}-chat") if nxt else None
     i = LADDER_NAMES.index(get_preset(name).name)
     return LADDER[i + 1] if i + 1 < len(LADDER) else None
 
 
 def describe_presets() -> str:
-    rows = [f"{'preset':7s}{'params':>10s}{'layers':>7s}{'d_model':>8s}{'heads/kv':>9s}{'ffn':>6s}"
+    rows = [f"{'preset':12s}{'params':>10s}{'layers':>7s}{'d_model':>8s}{'heads/kv':>9s}{'ffn':>6s}"
             f"{'ctx':>6s}{'batch tok':>10s}{'peak lr':>9s}{'byte budget':>12s}"]
     for p in LADDER:
         c = get_preset_config(p.name)
-        rows.append(f"{p.label:7s}{c.n_params() / 1e6:9.2f}M{c.n_layer:7d}{c.n_embd:8d}"
+        rows.append(f"{p.label:12s}{c.n_params() / 1e6:9.2f}M{c.n_layer:7d}{c.n_embd:8d}"
                     f"{c.n_head:5d}/{c.n_kv_head:<3d}{c.ffn_hidden:6d}{c.block_size:6d}"
                     f"{p.batch_tokens:10,d}{p.learning_rate:9.1e}{p.default_tokens / 1e6:10.0f}M")
+    rows.append("")
+    rows.append("Chat variants:")
+    for p in CHAT_LADDER:
+        c = get_preset_config(p.name)
+        rows.append(f"{p.label:12s}{c.n_params() / 1e6:9.2f}M{c.n_layer:7d}{c.n_embd:8d}"
+                    f"{c.n_head:5d}/{c.n_kv_head:<3d}{c.ffn_hidden:6d}{c.block_size:6d}"
+                    f"{get_preset(p.base_name).batch_tokens:10,d}{get_preset(p.base_name).learning_rate:9.1e}"
+                    f"{get_preset(p.base_name).default_tokens / 1e6:10.0f}M")
     return "\n".join(rows)
 
 
@@ -147,16 +228,30 @@ def train_setup(name: str, micro_batch: int, grad_accum: int, total_tokens: Opti
 
     ``total_tokens`` defaults to the preset's budget. Pass ``plan`` to reuse an existing plan
     (e.g. one derived from a wall-clock budget by ``plan_for_time_budget``)."""
-    p = get_preset(name)
-    cfg = get_preset_config(p.name)
-    tokens_per_step = micro_batch * grad_accum * cfg.block_size
-    plan = plan or make_plan(total_tokens or p.default_tokens, tokens_per_step, schedule)
-    tc = TrainConfig(
-        batch_size=micro_batch, grad_accum_steps=grad_accum, learning_rate=p.learning_rate,
-        min_lr=p.learning_rate / 10.0, optimizer=optimizer,
-        muon_weight_decay=0.0,   # measured: decay on the Muon matrices hurt at 500 steps (tools/ablation_round2.log)
-        ema_decay=default_ema_decay(plan.max_steps) if ema else 0.0,
-        eval_interval=max(50, plan.max_steps // 20), log_interval=max(1, plan.max_steps // 100))
+    key = _norm(name)
+    if key in _CHAT_BY_NAME:
+        p = _CHAT_BY_NAME[key]
+        base = get_preset(p.base_name)
+        cfg = get_preset_config(p.name)
+        tokens_per_step = micro_batch * grad_accum * cfg.block_size
+        plan = plan or make_plan(total_tokens or base.default_tokens, tokens_per_step, schedule)
+        tc = TrainConfig(
+            batch_size=micro_batch, grad_accum_steps=grad_accum, learning_rate=base.learning_rate,
+            min_lr=base.learning_rate / 10.0, optimizer=optimizer,
+            muon_weight_decay=0.0,
+            ema_decay=default_ema_decay(plan.max_steps) if ema else 0.0,
+            eval_interval=max(50, plan.max_steps // 20), log_interval=max(1, plan.max_steps // 100))
+    else:
+        p = get_preset(name)
+        cfg = get_preset_config(p.name)
+        tokens_per_step = micro_batch * grad_accum * cfg.block_size
+        plan = plan or make_plan(total_tokens or p.default_tokens, tokens_per_step, schedule)
+        tc = TrainConfig(
+            batch_size=micro_batch, grad_accum_steps=grad_accum, learning_rate=p.learning_rate,
+            min_lr=p.learning_rate / 10.0, optimizer=optimizer,
+            muon_weight_decay=0.0,
+            ema_decay=default_ema_decay(plan.max_steps) if ema else 0.0,
+            eval_interval=max(50, plan.max_steps // 20), log_interval=max(1, plan.max_steps // 100))
     for k, v in tc_overrides.items():
         if not hasattr(tc, k):
             raise TypeError(f"TrainConfig has no field {k!r}")

@@ -13,6 +13,8 @@
     probe     --ckpt R/ckpt_best.pt            attention reach + copy/retrieval probe at increasing distances
     bench     --ckpt R/ckpt_best.pt            generation latency (window vs streaming) + SDPA backends
     continual --ckpt C --old_dir A --new_dir B new-only vs replay vs replay+EWC, matched budget
+    chat      --ckpt R/ckpt_best.pt --system "..."  interactive multi-turn chat
+    sft       --base_ckpt R/ckpt_best.pt --data_dir D --out_dir R  supervised fine-tuning
 
 Multi-GPU: ``torchrun --nproc_per_node=2 -m tensegrity train ...`` (DDP is picked up from the
 environment).
@@ -29,7 +31,7 @@ import json
 import sys
 
 from . import __version__
-LADDER_NAMES = ("1m", "2m", "5m", "10m", "50m", "115m")
+from .presets import LADDER_NAMES, CHAT_PRESET_NAMES, ALL_PRESET_NAMES
 
 
 def _bool(x: str) -> bool:
@@ -365,6 +367,133 @@ def cmd_export(args) -> None:
     print(f"[export] {w}\n[export] {c}")
 
 
+def cmd_chat(args) -> None:
+    """Interactive multi-turn chat with a checkpoint."""
+    import torch
+    from .checkpoint import load_model
+    from .chat import ChatSession
+    from .hw import pick_device
+    from .tokenizer import ByteTokenizer
+
+    device = pick_device(args.device)
+    model, cfg, _ = load_model(args.ckpt, device, use_ema=args.ema)
+    model.eval()
+
+    session = ChatSession(
+        model,
+        system_prompt=args.system,
+        max_history_tokens=args.max_history_tokens,
+        sampling_kwargs={
+            "temperature": args.temp,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+            "min_p": args.min_p,
+            "repetition_penalty": args.rep_penalty,
+            "frequency_penalty": args.freq_penalty,
+            "presence_penalty": args.pres_penalty,
+            "use_confidence_temp": args.use_confidence_temp,
+        }
+    )
+
+    print(f"[chat] Model: {cfg.describe()}")
+    print(f"[chat] System prompt: {args.system or '(none)'}")
+    print(f"[chat] Type /reset to clear history, /stats for cache stats, /quit to exit")
+    print("-" * 60)
+
+    while True:
+        try:
+            user_input = input("User: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if not user_input:
+            continue
+
+        if user_input == "/quit":
+            break
+        elif user_input == "/reset":
+            session.reset()
+            print("[chat] History cleared (system prompt retained)")
+            continue
+        elif user_input == "/stats":
+            stats = session.get_stats()
+            print(f"[chat] Cached tokens: {stats['cached_tokens']}, System: {stats['system_tokens']}, "
+                  f"Turns: {stats['turn_count']}, KV memory: {stats['kv_memory_mb']:.1f} MB")
+            continue
+
+        # Stream response
+        print("Assistant: ", end="", flush=True)
+        for chunk in session.stream(user_input):
+            print(chunk, end="", flush=True)
+        print()  # newline after response
+
+
+def cmd_sft(args) -> None:
+    """Supervised fine-tuning from a base checkpoint to ChatML."""
+    import torch
+    from .checkpoint import load_model, save_checkpoint
+    from .growth import grow_model
+    from .hw import autotune_micro_batch, measure_throughput, pick_device, pick_dtype
+    from .model import TensegrityLM
+    from .presets import get_preset_config, train_setup
+    from .schedule import make_plan, plan_for_time_budget
+    from .train import TrainConfig, Trainer, preflight_or_fallback
+    from .workflow import prepare_sft_from_base
+
+    device = pick_device(args.device)
+    dtype = pick_dtype(args.dtype, device)
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    print(f"[sft] Loading base checkpoint from {args.base_ckpt}")
+    # Use the workflow helper to prepare model for SFT
+    model, cfg = prepare_sft_from_base(
+        args.base_ckpt,
+        new_vocab_size=args.vocab_size,
+        new_block_size=args.block_size,
+        new_rope_base=args.rope_base,
+        device=device
+    )
+
+    print(f"[sft] SFT config: {cfg.describe()}")
+
+    # Training setup
+    torch.random.default_generator.manual_seed(args.seed)
+    target_tokens = args.tokens or 100_000_000  # smaller budget for SFT
+    if args.micro_batch:
+        mb, accum = args.micro_batch, args.grad_accum or 1
+    else:
+        model.to(device)
+        tune = autotune_micro_batch(model, cfg.block_size, device, dtype, 65536)
+        mb, accum = tune["micro_batch"], tune["grad_accum"]
+        model.grad_checkpoint = tune["grad_checkpoint"]
+
+    tokens_per_step = mb * accum * cfg.block_size
+    if args.hours:
+        tps = measure_throughput(model.to(device), mb, cfg.block_size, device, dtype)
+        plan = plan_for_time_budget(tps, args.hours, tokens_per_step, max_tokens=target_tokens)
+        print(f"[sft] measured {tps / 1e3:.1f}k tok/s -> {plan.total_tokens / 1e6:.0f}M tokens in ~{args.hours}h")
+    else:
+        plan = make_plan(target_tokens, tokens_per_step)
+
+    # SFT-specific training config (lower LR, cosine schedule, dropout)
+    tc = TrainConfig(
+        batch_size=mb, grad_accum_steps=accum,
+        learning_rate=args.learning_rate or 1e-4,
+        min_lr=(args.learning_rate or 1e-4) / 10,
+        optimizer=args.optimizer,
+        dtype=args.dtype, seed=args.seed,
+        max_minutes=args.max_minutes,
+        schedule="cosine",
+        dropout=0.05,
+    )
+    tc = preflight_or_fallback(model, tc, args.device)
+
+    trainer = Trainer(model, tc, plan, args.data_dir, args.out_dir, device=args.device)
+    res = trainer.fit(resume=False)
+    print(f"[sft] Completed: {res['status']}, step={res['step']}, best_val_loss={res['best_val_loss']:.4f}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="tensegrity", description=f"TensegrityLM {__version__}")
     ap.add_argument("--version", action="version", version=f"Tensegrity {__version__}")
@@ -391,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--doc_sep", default=None, help="literal separator mapped to EOS, e.g. '<|endoftext|>'")
     p.add_argument("--max_mb", type=_number, default=None)
-    p.add_argument("--format", choices=["text", "jsonl", "parquet"], default=None,
+    p.add_argument("--format", choices=["text", "jsonl", "parquet", "chatml"], default=None,
                    help="force a reader for files with an unrecognised extension")
     p.add_argument("--text_field", default=None, help="jsonl key / parquet column holding the text (default: auto)")
     p.add_argument("--record_template", default=None,
@@ -418,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_audit)
 
     p = sub.add_parser("train", help="train or resume")
-    p.add_argument("--preset", default="5m", help=f"ladder {list(LADDER_NAMES)} or legacy name")
+    p.add_argument("--preset", default="5m", help=f"ladder {list(ALL_PRESET_NAMES)} or legacy name")
     p.add_argument("--data_dir", required=True)
     p.add_argument("--out_dir", required=True)
     p.add_argument("--hours", type=_number, default=None, help="size the run to this wall-clock budget")
@@ -482,7 +611,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_grow)
 
     p = sub.add_parser("preflight", help="decisive pre-run report: size, attention reach, data, numerics, memory, reload")
-    p.add_argument("--preset", default="5m", choices=list(LADDER_NAMES))
+    p.add_argument("--preset", default="5m", choices=list(ALL_PRESET_NAMES))
     p.add_argument("--data_dir", required=True)
     p.add_argument("--tokens", type=_number, default=None)
     p.add_argument("--micro_batch", type=_positive_int, default=None)
@@ -537,6 +666,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
     p.add_argument("--ema", action="store_true")
     p.set_defaults(fn=cmd_export)
+
+    p = sub.add_parser("chat", help="interactive multi-turn chat with a checkpoint")
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--system", default="", help="system prompt (pinned in KV cache)")
+    p.add_argument("--temp", type=_nonnegative_float, default=0.7)
+    p.add_argument("--top_k", type=_positive_int, default=40)
+    p.add_argument("--top_p", type=_positive_probability, default=None)
+    p.add_argument("--min_p", type=_probability, default=0.05)
+    p.add_argument("--rep_penalty", type=_number, default=1.12, help="repetition penalty")
+    p.add_argument("--freq_penalty", type=_number, default=0.0, help="frequency penalty")
+    p.add_argument("--pres_penalty", type=_number, default=0.0, help="presence penalty")
+    p.add_argument("--use_confidence_temp", action="store_true")
+    p.add_argument("--max_history_tokens", type=_positive_int, default=None, help="max tokens in KV cache")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--ema", action="store_true")
+    p.set_defaults(fn=cmd_chat)
+
+    p = sub.add_parser("sft", help="supervised fine-tuning from base checkpoint to ChatML")
+    p.add_argument("--base_ckpt", required=True, help="base pretrained checkpoint")
+    p.add_argument("--data_dir", required=True, help="ChatML format dataset directory (with .mask files)")
+    p.add_argument("--out_dir", required=True, help="output directory for SFT checkpoint")
+    p.add_argument("--hours", type=_number, default=None, help="wall-clock budget")
+    p.add_argument("--tokens", type=_number, default=None, help="token budget (default: 100M)")
+    p.add_argument("--optimizer", choices=["muon", "adamw"], default="adamw")
+    p.add_argument("--learning_rate", type=_number, default=None, help="peak LR (default: 1e-4)")
+    p.add_argument("--micro_batch", type=_positive_int, default=None)
+    p.add_argument("--grad_accum", type=_positive_int, default=None)
+    p.add_argument("--max_minutes", type=_number, default=None)
+    p.add_argument("--vocab_size", type=_positive_int, default=265)
+    p.add_argument("--block_size", type=_positive_int, default=2048)
+    p.add_argument("--rope_base", type=_number, default=50000.0)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--dtype", default="auto", choices=["auto", "float32", "bfloat16", "float16"])
+    p.add_argument("--seed", type=int, default=1337)
+    p.set_defaults(fn=cmd_sft)
+
     return ap
 
 

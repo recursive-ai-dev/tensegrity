@@ -18,6 +18,78 @@ import json
 import os
 import sys
 
+# Mock torch for building the notebook without GPU dependencies
+import types
+torch = types.ModuleType('torch')
+torch.nn = types.ModuleType('torch.nn')
+torch.nn.Module = type('Module', (), {})
+torch.nn.Parameter = type('Parameter', (), {})
+torch.nn.Linear = type('Linear', (), {})
+torch.nn.Embedding = type('Embedding', (), {})
+torch.nn.Dropout = type('Dropout', (), {})
+torch.nn.LayerNorm = type('LayerNorm', (), {})
+torch.nn.functional = types.ModuleType('torch.nn.functional')
+torch.optim = types.ModuleType('torch.optim')
+torch.utils = types.ModuleType('torch.utils')
+torch.utils.checkpoint = types.ModuleType('torch.utils.checkpoint')
+torch.distributed = types.ModuleType('torch.distributed')
+torch.cuda = types.ModuleType('torch.cuda')
+torch.Generator = type('Generator', (), {})
+torch.Tensor = type('Tensor', (), {})
+torch.device = lambda x: x
+torch.float32 = 'float32'
+torch.float16 = 'float16'
+torch.bfloat16 = 'bfloat16'
+torch.int64 = 'int64'
+torch.int32 = 'int32'
+torch.long = 'long'
+torch.bool = 'bool'
+torch.tensor = lambda *a, **k: None
+torch.zeros = lambda *a, **k: None
+torch.ones = lambda *a, **k: None
+torch.full = lambda *a, **k: None
+torch.empty = lambda *a, **k: None
+torch.arange = lambda *a, **k: None
+torch.cat = lambda *a, **k: None
+torch.stack = lambda *a, **k: None
+torch.no_grad = lambda: type('ctx', (), {'__enter__': lambda s: None, '__exit__': lambda s, *a: None, '__call__': lambda self, f: f})()
+torch.manual_seed = lambda x: None
+torch.randint = lambda *a, **k: None
+torch.rand = lambda *a, **k: None
+torch.tril = lambda *a, **k: None
+torch.is_floating_point = lambda x: False
+torch.is_grad_enabled = lambda: False
+torch.set_grad_enabled = lambda x: None
+torch.save = lambda *a, **k: None
+torch.load = lambda *a, **k: {}
+torch.jit = types.ModuleType('torch.jit')
+torch.compile = lambda x: x
+torch.cuda.current_device = lambda: 0
+torch.cuda.get_device_capability = lambda x: (8, 0)
+torch.cuda.is_available = lambda: False
+torch.backends = types.ModuleType('torch.backends')
+torch.backends.cuda = types.ModuleType('torch.backends.cuda')
+torch.backends.cuda.enable_flash_sdp = lambda x: None
+torch.backends.cuda.enable_mem_efficient_sdp = lambda x: None
+torch.backends.cuda.enable_math_sdp = lambda x: None
+
+# nn.functional functions used by layers.py
+torch.nn.functional.scaled_dot_product_attention = lambda *a, **k: None
+torch.nn.functional.rms_norm = lambda *a, **k: None
+torch.nn.functional.silu = lambda x: x
+torch.nn.functional.softmax = lambda *a, **k: None
+torch.nn.functional.cross_entropy = lambda *a, **k: None
+torch.nn.functional.binary_cross_entropy_with_logits = lambda *a, **k: None
+torch.nn.functional.pad = lambda *a, **k: None
+
+sys.modules['torch'] = torch
+sys.modules['torch.nn'] = torch.nn
+sys.modules['torch.nn.functional'] = torch.nn.functional
+sys.modules['torch.optim'] = torch.optim
+sys.modules['torch.utils'] = torch.utils
+sys.modules['torch.utils.checkpoint'] = torch.utils.checkpoint
+sys.modules['torch.distributed'] = torch.distributed
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, ROOT)
 

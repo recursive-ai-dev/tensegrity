@@ -1,9 +1,10 @@
 """Data access: deterministic/resumable batching over prepared datasets, dataset downloads, audits.
 
 Ingestion (``prepare_data`` and friends) lives in :mod:`tensegrity.ingest` and is re-exported here, so
-``tensegrity.data.prepare_data`` keeps working. On-disk format (unchanged from v1): ``train.bin`` /
-``val.bin`` are flat ``uint16`` token streams (bytes 0-255, EOS = 257 after every document) plus a
-``meta.json`` (a verifiable manifest since manifest version 1, see :mod:`tensegrity.manifest`).
+``tensegrity.data.prepare_data`` keeps working. On-disk format: ``train.bin`` / ``val.bin`` are flat
+``uint16`` token streams (bytes 0-255, EOS = 257 after every document). For ChatML format, parallel
+``train.mask`` / ``val.mask`` (uint8) files provide assistant-only loss masks. ``meta.json`` is a
+verifiable manifest (see :mod:`tensegrity.manifest`).
 """
 
 from __future__ import annotations
@@ -49,6 +50,9 @@ class ByteDataset:
       or rewritten while the dataset object lives, the next access notices: ``on_change="remap"``
       (default) warns and maps the new file, ``on_change="error"`` raises -- the Trainer uses the
       latter, because the data behind a run must not change under it.
+    * If a dataset has loss masks (``train.mask`` / ``val.mask``), they are loaded and applied
+      to produce assistant-only targets (masked positions get target=-1).
+    * Returns ``doc_ids`` for intra-document causal attention masking.
     """
 
     def __init__(self, data_dirs, weights: Optional[Sequence[float]] = None, seed: int = 1337, rank: int = 0,
@@ -71,6 +75,7 @@ class ByteDataset:
         self.on_change = on_change
         self.n_remaps = 0
         self._arrs: Dict[Tuple[str, str], np.memmap] = {}
+        self._mask_arrs: Dict[Tuple[str, str], np.memmap] = {}
         self._sigs: Dict[Tuple[str, str], Tuple[int, int, int]] = {}
 
     # ------------------------------------------------------------------ storage
@@ -102,9 +107,29 @@ class ByteDataset:
         self._arrs[key], self._sigs[key] = arr, sig
         return arr
 
+    def mask_array(self, data_dir: str, split: str) -> Optional[np.memmap]:
+        """Load loss mask array if it exists for this dataset/split."""
+        key = (data_dir, split)
+        path = os.path.join(data_dir, f"{split}.mask")
+        try:
+            sig = self._signature(path)
+        except FileNotFoundError:
+            return None
+        arr = self._mask_arrs.get(key)
+        if arr is not None and self._sigs.get(key) == sig:
+            return arr
+        if arr is not None:
+            self.n_remaps += 1
+            self._mask_arrs.pop(key, None)
+        arr = np.memmap(path, dtype=np.uint8, mode="r")
+        self._mask_arrs[key] = arr
+        # Note: we don't store sig separately for mask since it's tied to the token file
+        return arr
+
     def close(self) -> None:
         """Drop every memory map (they are re-opened lazily on the next access)."""
         self._arrs.clear()
+        self._mask_arrs.clear()
         self._sigs.clear()
 
     def n_tokens(self, split: str, dir_index: int = 0) -> int:
@@ -129,21 +154,45 @@ class ByteDataset:
             raise ValueError(f"{path}/{split}.bin has only {len(arr)} tokens, need > block_size "
                              f"({block_size + 1}). Use a larger corpus or a smaller block_size.")
 
-    def _gather(self, arr: np.ndarray, starts: np.ndarray, block_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _gather(self, arr: np.ndarray, starts: np.ndarray, block_size: int,
+                mask_arr: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Gather batch windows, returning (x, y, doc_ids).
+
+        x: (B, T) input tokens
+        y: (B, T) target tokens (with -1 for masked positions)
+        doc_ids: (B, T) document IDs for intra-document causal masking
+        """
         idx = starts[:, None] + np.arange(block_size + 1)[None, :]
         xy = arr[idx].astype(np.int64)
-        return xy[:, :-1], xy[:, 1:]
+        x, y = xy[:, :-1], xy[:, 1:]
 
-    def _to_device(self, x: np.ndarray, y: np.ndarray, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Apply loss mask if available (for ChatML assistant-only training)
+        if mask_arr is not None:
+            m = mask_arr[idx[:, 1:]]  # target positions
+            y = np.where(m == 1, y, -1)
+
+        # Compute document IDs for intra-document causal masking
+        # Increment doc_id right AFTER every EOS token so EOS belongs to the ending document
+        is_eos = (x == ByteTokenizer.EOS)
+        doc_ids = np.cumsum(is_eos, axis=1)
+        doc_ids = np.concatenate([np.zeros((x.shape[0], 1), dtype=np.int64), doc_ids[:, :-1]], axis=1)
+
+        return x, y, doc_ids
+
+    def _to_device(self, x: np.ndarray, y: np.ndarray, doc_ids: np.ndarray, device: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         xt = torch.from_numpy(np.ascontiguousarray(x))
         yt = torch.from_numpy(np.ascontiguousarray(y))
+        dt = torch.from_numpy(np.ascontiguousarray(doc_ids))
         if str(device).startswith("cuda"):
-            return xt.pin_memory().to(device, non_blocking=True), yt.pin_memory().to(device, non_blocking=True)
-        return xt.to(device), yt.to(device)
+            return (xt.pin_memory().to(device, non_blocking=True),
+                    yt.pin_memory().to(device, non_blocking=True),
+                    dt.pin_memory().to(device, non_blocking=True))
+        return xt.to(device), yt.to(device), dt.to(device)
 
     def get_batch(self, split: str, batch_size: int, block_size: int, device: str):
         x = np.empty((batch_size, block_size), dtype=np.int64)
         y = np.empty((batch_size, block_size), dtype=np.int64)
+        doc_ids = np.empty((batch_size, block_size), dtype=np.int64)
         if len(self.data_dirs) == 1:
             choices = np.zeros(batch_size, dtype=np.int64)
         else:
@@ -153,24 +202,26 @@ class ByteDataset:
             if rows.size == 0:
                 continue
             arr = self.array(d, split)
+            mask_arr = self.mask_array(d, split)
             self._check(arr, d, split, block_size)
             # a window starting at s needs tokens s .. s+block_size, so s <= len - block_size - 1;
             # `integers` excludes its upper bound, so len - block_size is exactly right.
             starts = self.rng.integers(0, len(arr) - block_size, size=rows.size)
-            x[rows], y[rows] = self._gather(arr, starts, block_size)
-        return self._to_device(x, y, device)
+            x[rows], y[rows], doc_ids[rows] = self._gather(arr, starts, block_size, mask_arr)
+        return self._to_device(x, y, doc_ids, device)
 
     def fixed_batches(self, split: str, n_batches: int, batch_size: int, block_size: int,
                       device: str, dir_index: int = 0, seed: int = 0):
         """Deterministic evaluation windows from ``data_dirs[dir_index]`` (same every call)."""
         arr = self.array(self.data_dirs[dir_index], split)
+        mask_arr = self.mask_array(self.data_dirs[dir_index], split)
         self._check(arr, self.data_dirs[dir_index], split, block_size)
         rng = np.random.default_rng([seed, 7919])
         out = []
         for _ in range(n_batches):
             starts = rng.integers(0, len(arr) - block_size, size=batch_size)
-            x, y = self._gather(arr, starts, block_size)
-            out.append(self._to_device(x, y, device))
+            x, y, doc_ids = self._gather(arr, starts, block_size, mask_arr)
+            out.append(self._to_device(x, y, doc_ids, device))
         return out
 
     def state_dict(self) -> Dict[str, Any]:
